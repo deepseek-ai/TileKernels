@@ -59,13 +59,15 @@ def print_average_perf(latency_list: list[float], bandwidth_list: list[float], r
 def dtype_to_str(dtype: torch.dtype) -> str:
     mapping = {
         torch.float32: 'fp32',
+        torch.float16: 'fp16',
         torch.bfloat16: 'bf16',
         torch.float8_e4m3fn: 'e4m3',
-        torch.int8: 'e2m1', # int8 represents FP4 e2m1 format
+        torch.float8_e5m2: 'e5m2',
+        torch.int8: 'e2m1',  # int8 represents FP4 e2m1 format
     }
 
     if dtype not in mapping:
-        raise ValueError(f'Unsupported dtype: {dtype}. Only fp32, bf16, e4m3, and int8(e2m1) are supported')
+        raise ValueError(f'Unsupported dtype: {dtype}. Only fp32, fp16, bf16, e4m3, e5m2, and int8(e2m1) are supported')
 
     return mapping[dtype]
 
