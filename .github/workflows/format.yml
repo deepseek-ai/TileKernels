@@ -1,0 +1,32 @@
+name: Code Format Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        cache: 'pip'
+
+    - name: Install formatters
+      run: |
+        pip install --upgrade pip
+        pip install 'yapf==0.40.2' 'ruff>=0.6.0'
+
+    - name: Run format.sh
+      run: |
+        bash ./format.sh
