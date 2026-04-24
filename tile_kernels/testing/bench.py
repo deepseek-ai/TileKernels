@@ -75,6 +75,8 @@ def _format_value(value):
         return dtype_to_str(value)
     if isinstance(value, tuple):
         return 'x'.join(str(v) for v in value)
+    if isinstance(value, dict):
+        return ','.join(f'{k}={_format_value(v)}' for k, v in sorted(value.items()))
     if value is None:
         return 'None'
     return str(value)
