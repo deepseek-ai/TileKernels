@@ -101,7 +101,10 @@ _WIDTH = {
 
 def make_param_key(params: dict) -> str:
     """Generate a unique key for a benchmark record."""
-    param_str = ','.join(f'{_SHORT_NAME.get(k, k)}={format(v, f">{_WIDTH.get(k)}") if k in _WIDTH else v}' for k, v in params.items() if v != None)
+    param_str = ','.join(
+        f'{_SHORT_NAME.get(k, k)}={_format_value(v) if k not in _WIDTH else format(v, f">{_WIDTH.get(k)}")}'
+        for k, v in params.items() if v is not None
+    )
     return f'{param_str}'
 
 
