@@ -4,6 +4,10 @@ import pytest
 import torch
 from tile_kernels.modeling.mhc.ops import mhc_post
 from tile_kernels.torch.mhc import mhc_post_ref
+from tests.conftest import IS_HIP
+
+# mhc_post_kernel uses PDL (Programmatic Dependent Launch) which is SM90+ NV-only feature
+pytestmark = pytest.mark.skipif(IS_HIP, reason='mhc_post_kernel uses PDL, an NV SM90+ feature not supported on HIP/AMD')
 
 
 def generate_mhc_post_test_data(

@@ -6,9 +6,14 @@ import tile_kernels
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# swiglu_forward_and_per_channel_cast_and_transpose_kernel fails HIP compilation:
+# TileLang generates invalid HIP code (uint1 2-arg constructor not supported in ROCm)
+pytestmark = pytest.mark.skipif(IS_HIP, reason='swiglu_forward_and_per_channel_cast_and_transpose_kernel fails HIP compilation (invalid uint1 constructor in generated code)')
 
 
 def generate_test_data(params):

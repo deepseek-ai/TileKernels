@@ -4,6 +4,10 @@ import pytest
 import torch
 from tile_kernels.modeling.mhc.ops import mhc_pre_apply_mix
 from tile_kernels.torch.mhc import mhc_pre_apply_mix_ref
+from tests.conftest import IS_HIP
+
+# mhc_pre_apply_mix kernel crashes on HIP/AMD (core dump, NV SM90+ feature dependency)
+pytestmark = pytest.mark.skipif(IS_HIP, reason='mhc_pre_apply_mix kernel crashes on HIP/AMD targets (NV SM90+ dependency)')
 
 
 def generate_pre_apply_mix_test_data(

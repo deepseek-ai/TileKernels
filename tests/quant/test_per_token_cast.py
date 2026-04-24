@@ -7,6 +7,7 @@ from tile_kernels.testing.bench import dtype_to_str, make_param_id
 from tile_kernels.testing.numeric import assert_equal, count_bytes, check_bias
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
 from tile_kernels.testing.quant import clear_unused_sf
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -63,11 +64,13 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         }
         for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
         for hidden_size in generate_hidden_sizes()
-        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in [(False, True, False), (True, True, True)]
-        for in_dtype in (torch.float32, torch.bfloat16, torch.float8_e4m3fn, torch.int8)
+        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in (
+            [(False, True, False)] if IS_HIP else [(False, True, False), (True, True, True)]
+        )
+        for in_dtype in (torch.float32, torch.bfloat16, torch.float8_e4m3fn) + (() if IS_HIP else (torch.int8,))
         for num_per_channels in ((32, 128) if in_dtype in (torch.float8_e4m3fn, torch.int8) else (32, 64, 128, hidden_size))
         for x_block_size in (((128, 128), (32, 32)) if in_dtype in (torch.float8_e4m3fn, torch.int8) else (None,))
-        for fmt in ('e4m3', 'e2m1')
+        for fmt in (('e4m3',) if IS_HIP else ('e4m3', 'e2m1'))
     ]
     if is_benchmark:
         params = [p for p in params if p['use_packed_ue8m0']]

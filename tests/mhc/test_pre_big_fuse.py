@@ -7,6 +7,10 @@ from tile_kernels.modeling.mhc.ops import (
     mhc_pre_split_mixes,
     sinkhorn_normalize,
 )
+from tests.conftest import IS_HIP
+
+# mhc_pre_big_fuse depends on mhc_pre_apply_mix and mhc_pre_norm_fn which crash/fail on HIP/AMD
+pytestmark = pytest.mark.skipif(IS_HIP, reason='mhc_pre_big_fuse depends on kernels not supported on HIP/AMD targets')
 
 
 def generate_big_fuse_test_data(

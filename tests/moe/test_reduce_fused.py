@@ -7,9 +7,13 @@ import tile_kernels
 from tile_kernels.testing.bench import dtype_to_str, make_param_id
 from tile_kernels.testing.generator import generate_topk_idx, generate_hidden_sizes, generate_moe_params
 from tile_kernels.testing.numeric import assert_equal, count_bytes
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# reduce_fused depends on get_fused_mapping which uses T.sync_warp() not supported on HIP/AMD targets
+pytestmark = pytest.mark.skipif(IS_HIP, reason='reduce_fused depends on get_fused_mapping (T.sync_warp()) not supported on HIP/AMD')
 
 
 def generate_test_data(params):

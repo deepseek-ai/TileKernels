@@ -9,9 +9,13 @@ from tile_kernels.testing.numeric import count_bytes, assert_equal
 from tile_kernels.testing.bench import make_param_id
 
 from tile_kernels.torch import topk_sum_and_topk_group_idx as torch_topk_sum_and_topk_group_idx
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# topk_sum_and_topk_group_idx_kernel uses T.sync_warp() which is not supported on HIP/AMD targets
+pytestmark = pytest.mark.skipif(IS_HIP, reason='topk_sum_and_topk_group_idx_kernel uses T.sync_warp() not supported on HIP/AMD')
 
 
 def torch_stable_topk(scores: torch.Tensor, num_topk: int):

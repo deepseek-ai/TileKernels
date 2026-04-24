@@ -9,9 +9,13 @@ from tile_kernels.config import set_num_sms
 from tile_kernels.testing.generator import generate_topk_idx, generate_moe_params, generate_num_sms
 from tile_kernels.testing.numeric import count_bytes
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# get_fused_mapping_kernel uses T.sync_warp() which is not supported on HIP/AMD targets
+pytestmark = pytest.mark.skipif(IS_HIP, reason='get_fused_mapping_kernel uses T.sync_warp() not supported on HIP/AMD')
 
 
 def generate_test_data(params):

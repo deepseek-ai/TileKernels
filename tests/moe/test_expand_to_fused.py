@@ -7,9 +7,13 @@ import tile_kernels
 from tile_kernels.testing.generator import generate_topk_idx, generate_hidden_sizes, generate_moe_params
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# expand_to_fused depends on get_fused_mapping which uses T.sync_warp() not supported on HIP/AMD targets
+pytestmark = pytest.mark.skipif(IS_HIP, reason='expand_to_fused depends on get_fused_mapping (T.sync_warp()) not supported on HIP/AMD')
 
 
 def generate_test_data_expand_to_fused(params):
@@ -98,7 +102,9 @@ def generate_test_params_expand_with_sf(is_benchmark: bool) -> list[dict]:
         for moe in generate_moe_params(is_benchmark=is_benchmark)
         for hidden in generate_hidden_sizes()
         for num_per_channels in (32, 128)
-        for col_major, round_sf, packed_ue8m0 in [(False, True, False), (True, True, True)]
+        for col_major, round_sf, packed_ue8m0 in (
+            [(False, True, False)] if IS_HIP else [(False, True, False), (True, True, True)]
+        )
     ]
 
 

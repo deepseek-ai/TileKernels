@@ -3,7 +3,6 @@ from typing import Optional, Union
 
 import torch
 from tilelang import language as T
-from tilelang.contrib import nvcc
 from tilelang.utils.target import determine_target
 
 from tile_kernels.quant.types import QuantTensor
@@ -12,6 +11,10 @@ from tile_kernels.utils import align, ceil_div
 
 def get_best_vectorize_size(dtype: T.dtype) -> int:
     target = determine_target(return_object=True)
+    if target.kind.name == 'hip':
+        # AMD GPU: use 16-byte vectorized loads (128-bit, supported on gfx90x/gfx950)
+        return 16 // dtype.bytes
+    from tilelang.contrib import nvcc
     ver = nvcc.get_target_compute_version(target)  # e.g. "8.6"
     major, _ = nvcc.parse_compute_version(ver)
     return (16 if major < 10 else 32) // dtype.bytes
