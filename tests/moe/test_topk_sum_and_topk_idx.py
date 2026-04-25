@@ -9,9 +9,14 @@ from tile_kernels.testing.numeric import count_bytes, assert_equal
 from tile_kernels.testing.bench import make_param_id
 
 from tile_kernels.torch import topk_sum_and_topk_group_idx as torch_topk_sum_and_topk_group_idx
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# HIP fix: T.alloc_var(init=0) now generates count_var[0] = 0 initialization.
+# Previously the block_attr path skipped init code on HIP, causing count_var
+# to hold garbage and writes to wrong indices in topk_group_idx_shared.
 
 
 def torch_stable_topk(scores: torch.Tensor, num_topk: int):

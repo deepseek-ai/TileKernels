@@ -57,6 +57,7 @@ def _mhc_pre_big_fuse(
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
+            T.sync_threads()
             if T.get_thread_binding() < 32:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
@@ -101,28 +102,23 @@ def _mhc_pre_big_fuse(
                     comb_mix[pid, j * mhc_mult + k] = cm[j, k]
             else:
                 ##################################################################
-                # _mhc_pre_split_mixes_fwd (pre)
-                pre_mix_shared = T.alloc_shared(mhc_mult, T.float32)
-                for j in T.Parallel(mhc_mult):
-                    pre_mix_shared[j] = (
-                        T.sigmoid(
-                            mixes_shared[j] * mhc_scale[0] + mhc_base[j],
-                        )
-                        + mhc_pre_eps
-                    )
-                ###################################################################
-                # _mhc_pre_apply_mix_fwd
-                for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-                    xs = T.alloc_shared((mhc_mult, hidden_block), T.bfloat16)
-                    xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
+                # _mhc_pre_split_mixes_fwd (pre) + _mhc_pre_apply_mix_fwd
+                # Read pre_mix values directly from mixes_shared inside the loop.
+                # Use T.Pipelined with num_stages=1 so the pipeline pass doesn't
+                # allocate double-buffers that could interfere with the syncs.
+                xs = T.alloc_shared((mhc_mult, hidden_block), T.bfloat16)
+                xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
+                ol = T.alloc_fragment(hidden_block, T.float32)
+                for i0_h in T.serial(hidden_size // hidden_block):
+                    T.sync_threads()
                     T.copy(residual[pid, 0, i0_h * hidden_block], xs, disable_tma=True)
+                    T.sync_threads()
                     T.copy(xs, xl, disable_tma=True)
 
-                    ol = T.alloc_fragment(hidden_block, T.float32)
                     T.clear(ol)
 
                     for i_mhc in T.serial(mhc_mult):
-                        pre = pre_mix_shared[i_mhc]
+                        pre = T.sigmoid(mixes_shared[i_mhc] * mhc_scale[0] + mhc_base[i_mhc]) + mhc_pre_eps
                         for i1_h in T.Parallel(hidden_block):
                             ol[i1_h] += pre * xl[i_mhc, i1_h]
 

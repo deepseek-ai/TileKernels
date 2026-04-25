@@ -5,7 +5,7 @@ import torch
 import tilelang
 from tilelang import language as T
 
-from tile_kernels.config import get_max_smem_per_sm, get_num_sms
+from tile_kernels.config import get_max_smem_per_sm, get_num_sms, get_warp_size
 
 
 @tilelang.jit(

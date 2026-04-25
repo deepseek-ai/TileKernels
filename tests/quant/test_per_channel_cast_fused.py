@@ -8,9 +8,14 @@ from tile_kernels.testing.generator import generate_topk_idx, generate_hidden_si
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
 from tile_kernels.torch.per_channel_cast_fused import per_channel_cast_fused as torch_ref_per_channel_cast_fused
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# per_channel_cast_fused depends on get_fused_mapping which uses __match_any_sync (no AMD equivalent)
+pytestmark = pytest.mark.skipif(IS_HIP, reason='per_channel_cast_fused depends on get_fused_mapping which uses __match_any_sync (no HIP/AMD equivalent)')
+
 
 
 def generate_test_data(params):

@@ -2,6 +2,9 @@ import pytest
 import torch
 from tile_kernels.modeling.mhc.ops import mhc_pre_norm_fn
 from tile_kernels.torch.mhc import mhc_pre_norm_fn_ref
+from tests.conftest import IS_HIP
+
+# Testing after T.Pipelined and T.alloc_var fixes.
 
 
 def generate_norm_fn_test_data(

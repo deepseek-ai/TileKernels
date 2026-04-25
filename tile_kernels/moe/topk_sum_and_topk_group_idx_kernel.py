@@ -6,6 +6,7 @@ from tilelang import language as T
 
 from tile_kernels.moe.common import get_topk_group_idx
 from tile_kernels.utils import align
+from tile_kernels.config import get_warp_size
 
 
 @tilelang.jit(
@@ -21,12 +22,13 @@ def get_topk_sum_and_topk_group_idx_kernel(
     num_topk_groups: int,
     num_topk_sum: int,
 ):
-    num_threads = 32
+    warp_size = get_warp_size()
+    num_threads = warp_size
     num_experts = num_experts_per_group * num_groups
     num_aligned_experts = align(num_experts, num_threads)
-    num_tokens_per_block = num_threads // 32
+    num_tokens_per_block = 1  # one wavefront per token
 
-    assert num_groups <= 32, f'num_groups ({num_groups}) must be <= warp size (32)'
+    assert num_groups <= warp_size, f'num_groups ({num_groups}) must be <= warp size ({warp_size})'
 
     # Make sure that the number of experts per group is divisible by vectorization size.
     num_vectorize_for_grouped_expert = 4
@@ -46,8 +48,8 @@ def get_topk_sum_and_topk_group_idx_kernel(
             topk_group_idx_shared = T.alloc_shared((num_tokens_per_block, num_topk_groups), T.int32)
 
             thread_idx = T.get_thread_binding()
-            warp_idx = thread_idx // 32
-            lane_idx = thread_idx % 32
+            warp_idx = thread_idx // warp_size
+            lane_idx = thread_idx % warp_size
 
             T.copy(scores[pid * num_tokens_per_block, 0], scores_shared)
             T.sync_warp()
@@ -60,6 +62,7 @@ def get_topk_sum_and_topk_group_idx_kernel(
                 num_topk_groups=num_topk_groups,
                 num_topk_sum=num_topk_sum,
                 num_vectorize_for_grouped_expert=num_vectorize_for_grouped_expert,
+                warp_size=warp_size,
             )
 
             if lane_idx < num_topk_groups:

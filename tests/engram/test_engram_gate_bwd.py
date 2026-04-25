@@ -7,6 +7,7 @@ from tile_kernels.torch.engram import engram_gate_ref
 from tile_kernels.testing.numeric import calc_diff, count_bytes
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -37,6 +38,7 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
     ]
 
 
+@pytest.mark.skipif(IS_HIP, reason='engram_gate_bwd uses T.get_warp_idx() which is not supported on HIP/AMD targets')
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
 def test_engram_gate_bwd(params):
     (x_data, k_data, v_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value) = generate_test_data(params)
@@ -76,6 +78,7 @@ def test_engram_gate_bwd(params):
 
 
 @pytest.mark.benchmark
+@pytest.mark.skipif(IS_HIP, reason='engram_gate_bwd uses T.get_warp_idx() which is not supported on HIP/AMD targets')
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
 def test_engram_gate_bwd_benchmark(benchmark_timer, benchmark_record, params):
     (x_data, k_data, v_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value) = generate_test_data(params)

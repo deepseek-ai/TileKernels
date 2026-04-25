@@ -6,9 +6,13 @@ import tile_kernels
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# HIP compilation fix: tilelang codegen_hip.cc now handles ShuffleNode for
+# bfloat16x2/float16x2 using __pack_bfloat162/__pack_half2 with ROCm's uint1.
 
 
 def generate_test_data(params):

@@ -9,9 +9,14 @@ from tile_kernels.config import set_num_sms
 from tile_kernels.testing.generator import generate_topk_idx, generate_hidden_sizes, generate_moe_params, generate_num_sms
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# swiglu_forward depends on get_fused_mapping which uses __match_any_sync (no AMD equivalent)
+pytestmark = pytest.mark.skipif(IS_HIP, reason='swiglu_forward_and_per_token_cast depends on get_fused_mapping which uses __match_any_sync (no HIP/AMD equivalent)')
+
 
 
 def generate_test_data(params):
@@ -49,7 +54,9 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for enable_pos_to_expert in (True, False)
         for with_weights in (True, False)
         for num_per_channels in (128, hidden_size)
-        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in [(False, True, False), (True, True, True)]
+        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in (
+            [(False, True, False)] if IS_HIP else [(False, True, False), (True, True, True)]
+        )
         if not ((use_packed_ue8m0 and with_weights) or (use_tma_aligned_col_major_sf and num_per_channels == hidden_size))
         for swiglu_clamp_value in (None, 10.0, 0.5)
     ]

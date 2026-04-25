@@ -1,3 +1,4 @@
+import math
 import torch
 import tilelang
 from tilelang import language as T
@@ -7,13 +8,14 @@ import os
 from tile_kernels.utils import align, ceil_div
 from tile_kernels.moe.scoring import ScoringFunc, softplus
 from tile_kernels.moe.common import get_topk_group_idx
+from tile_kernels.config import get_warp_size
 
 
 @T.macro
-def warp_reduce_sum(x: T.Ref):
-    # Keep the same with the old implementation
-    for i in T.unroll(0, 5):
-        x += T.shfl_xor(x, 1 << (4 - i))
+def warp_reduce_sum(x: T.Ref, warp_size: int = 32):
+    n_steps = int(math.log2(warp_size))
+    for i in T.unroll(0, n_steps):
+        x += T.shfl_xor(x, 1 << (n_steps - 1 - i), width=warp_size)
 
 
 @tilelang.jit(
@@ -31,9 +33,16 @@ def get_top2_sum_gate_kernel(
     mask_exists: bool, fix_routing_mask_exists: bool,
     unmapped_topk_idx_exists: bool, to_physical_map_exists: bool,
 ):  # fmt: off
-    # Kernel config
+    # Kernel config — logical warp_size=32 for algorithmic correctness.
+    # The top-k tie-breaking semantics are defined by the 5-step (offsets
+    # 1,2,4,8,16) butterfly reduction with width=32. Using a wider reduction
+    # (warp_size=64) changes the comparison order and produces different results
+    # for equal-score experts, breaking the CUDA-compatible test contract.
+    # On CDNA (wave64) the width=32 shfl calls keep shuffles within the active
+    # 32-lane half of the wavefront, avoiding reads from uninitialised VGPRs.
     warp_size = 32
-    num_threads = 32
+    num_threads = warp_size
+    n_reduce_steps = int(math.log2(warp_size))
     assert num_topk <= warp_size, f'num_topk must be less than or equal to {warp_size}'
 
     # Each warp handles one token
@@ -97,9 +106,9 @@ def get_top2_sum_gate_kernel(
     ):
         with T.Kernel(num_tokens, threads=num_threads) as pid:
             thread_idx = T.get_thread_binding()
-            token_idx = thread_idx // 32
+            token_idx = thread_idx // warp_size
             global_token_idx = token_idx + pid * num_tokens_per_block
-            lane_idx = thread_idx % 32
+            lane_idx = thread_idx % warp_size
 
             scores_shared = T.alloc_shared((num_tokens_per_block, num_routed_experts), dtype=T.float32)
             scores_wo_bias_shared = T.alloc_shared((num_tokens_per_block, num_routed_experts), dtype=T.float32)
@@ -161,7 +170,7 @@ def get_top2_sum_gate_kernel(
                         for j in T.unroll(num_vectorize):
                             scores_local[i * num_vectorize + j] = T.exp(scores_local[i * num_vectorize + j] - logit_max_var)
                             logit_sum_var += scores_local[i * num_vectorize + j]
-                warp_reduce_sum(logit_sum_var)
+                warp_reduce_sum(logit_sum_var, warp_size=warp_size)
                 T.sync_warp()
 
             for i in T.unroll(0, T.ceildiv(num_routed_experts, num_vectorize * warp_size)):
@@ -207,6 +216,7 @@ def get_top2_sum_gate_kernel(
                         num_topk_groups,
                         num_topk_sum,
                         num_vectorize_for_grouped_expert,
+                        warp_size=warp_size,
                     )
 
                     # Sort group indices in ascending order to ensure stable sort
@@ -241,9 +251,9 @@ def get_top2_sum_gate_kernel(
                             topk_idx_local[k] = idx_local[i]
 
                     # Get max score across all threads
-                    for i in T.unroll(5):
-                        other_score = T.shfl_xor(topk_scores_local[k], 1 << i)
-                        other_idx = T.shfl_xor(topk_idx_local[k], 1 << i)
+                    for i in T.unroll(n_reduce_steps):
+                        other_score = T.shfl_xor(topk_scores_local[k], 1 << i, width=warp_size)
+                        other_idx = T.shfl_xor(topk_idx_local[k], 1 << i, width=warp_size)
                         if other_score > topk_scores_local[k] or (other_score == topk_scores_local[k] and other_idx < topk_idx_local[k]):
                             topk_scores_local[k] = other_score
                             topk_idx_local[k] = other_idx
@@ -262,7 +272,7 @@ def get_top2_sum_gate_kernel(
             # Get topk sum
             topk_sum_var = 1e-20
             for i in T.unroll(num_topk):
-                topk_sum_var += T.shfl_sync(topk_score_var, i)
+                topk_sum_var += T.shfl_sync(topk_score_var, i, width=warp_size)
 
             # Ensure one warp can handle one token
             T.device_assert(num_physical_topk <= warp_size)

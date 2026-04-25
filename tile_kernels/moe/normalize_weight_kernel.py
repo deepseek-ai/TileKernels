@@ -2,6 +2,11 @@ import os
 import torch
 import tilelang
 from tilelang import language as T
+from tilelang.utils.target import determine_target
+
+
+def _is_hip() -> bool:
+    return determine_target(return_object=True).kind.name == 'hip'
 
 
 @tilelang.jit(
@@ -11,6 +16,9 @@ from tilelang import language as T
 )
 def get_normalize_weight_kernel(num_topk: int):
     num_threads = 128
+    # T.vectorized generates vector load/store instructions on CUDA (e.g. float4),
+    # but produces NaN outputs on HIP due to AMD backend codegen limitations.
+    loop = T.unroll if _is_hip() else T.vectorized
 
     num_tokens = T.dynamic('num_tokens')
     num_blocks = T.ceildiv(num_tokens, 128)
@@ -28,16 +36,22 @@ def get_normalize_weight_kernel(num_topk: int):
 
             if row < num_tokens:
                 # NOTE: Align with top2_sum_gate kernel implementation
-                sum = T.alloc_var(T.float32, init=1e-20)
-                for i in T.vectorized(num_topk):
+                # Use T.alloc_local + explicit BufferStore for initialization.
+                # T.alloc_var(init=float_literal) uses block_attr which is not
+                # reliably lowered to initialization code on all backends (e.g.
+                # the generated HIP kernel omits the assignment, leaving the
+                # register uninitialized and producing NaN on AMD hardware).
+                sum = T.alloc_local((1,), T.float32)
+                sum[0] = 1e-20
+                for i in loop(num_topk):
                     weights_local[i] = topk_weights[row, i]
 
                 for i in T.unroll(num_topk):
-                    sum += weights_local[i]
+                    sum[0] = sum[0] + weights_local[i]
 
-                denominator[row] = sum
-                for i in T.vectorized(num_topk):
-                    normalized_weights[row, i] = weights_local[i] / sum
+                denominator[row] = sum[0]
+                for i in loop(num_topk):
+                    normalized_weights[row, i] = weights_local[i] / sum[0]
 
     return normalize_weight_kernel
 

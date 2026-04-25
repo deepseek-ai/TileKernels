@@ -12,9 +12,13 @@ from tile_kernels.testing.bench import make_param_id
 
 from tile_kernels.torch import topk_sum_and_topk_group_idx as torch_topk_sum_and_topk_group_idx
 from tile_kernels.torch import top2_sum_gate as torch_top2_sum_gate
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+# HIP fixes: T.sync_warp() now supported (compiler memory fence).
+#            T.alloc_var(init=0) now generates initialization code.
 
 
 _CONFIGS = [

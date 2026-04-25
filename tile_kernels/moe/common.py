@@ -10,10 +10,11 @@ def get_topk_group_idx(
     num_topk_groups: int,
     num_topk_sum: int,
     num_vectorize_for_grouped_expert: int,
+    warp_size: int = 32,
 ):
     thread_idx = T.get_thread_binding()
-    token_idx = thread_idx // 32
-    lane_idx = thread_idx % 32
+    token_idx = thread_idx // warp_size
+    lane_idx = thread_idx % warp_size
     scores_vec_local = T.alloc_local((num_vectorize_for_grouped_expert,), dtype=T.float32)
 
     top1_var = T.alloc_var(dtype=T.float32, init=-T.infinity(T.float32))
@@ -40,7 +41,7 @@ def get_topk_group_idx(
 
     # Count the number of groups that have a larger top2 sum
     for i in T.unroll(num_groups):
-        other_top2_sum = T.shfl_sync(topk_sum_var, i)
+        other_top2_sum = T.shfl_sync(topk_sum_var, i, width=warp_size)
         if other_top2_sum > topk_sum_var or (other_top2_sum == topk_sum_var and i < lane_idx):
             count_var += 1
 

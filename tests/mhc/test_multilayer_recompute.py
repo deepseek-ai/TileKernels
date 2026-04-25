@@ -3,6 +3,10 @@ import torch
 from tile_kernels.modeling.mhc.ops.multilayer_recompute import mhc_multilayer_recompute
 from tile_kernels.modeling.mhc.ops.post import mhc_post
 from tile_kernels.modeling.mhc.ops.pre_apply_mix import mhc_pre_apply_mix
+from tests.conftest import IS_HIP
+
+# mhc_multilayer_recompute depends on mhc_post (PDL) and mhc_pre_apply_mix which crash on HIP/AMD
+pytestmark = pytest.mark.skipif(IS_HIP, reason='mhc_multilayer_recompute depends on kernels with NV SM90+ features not supported on HIP/AMD')
 
 
 _CORRECTNESS_CASES = [

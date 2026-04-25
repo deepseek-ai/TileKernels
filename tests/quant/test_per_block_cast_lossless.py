@@ -7,6 +7,7 @@ import tile_kernels
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens, generate_rand_float
 from tile_kernels.testing.bench import make_param_id
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -79,6 +80,7 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
     return params
 
 
+@pytest.mark.skipif(IS_HIP, reason='per_block_cast_lossless uses e2m1 (FP4) which is not supported on HIP/AMD targets')
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
 def test_per_block_cast_lossless(params):
     out_sf_block = params['out_sf_block']
@@ -97,6 +99,7 @@ def test_per_block_cast_lossless(params):
 
 
 @pytest.mark.benchmark
+@pytest.mark.skipif(IS_HIP, reason='per_block_cast_lossless uses e2m1 (FP4) which is not supported on HIP/AMD targets')
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=True), ids=make_param_id)
 def test_per_block_cast_lossless_benchmark(benchmark_timer, benchmark_record, params):
     _, x_fp4, cast_func = generate_test_data(params)

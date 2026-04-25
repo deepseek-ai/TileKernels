@@ -7,6 +7,7 @@ from tile_kernels.testing.bench import dtype_to_str, make_param_id
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens, generate_e5m6_inputs
 from tile_kernels.testing.numeric import assert_equal, calc_diff, count_bytes
 from tile_kernels.torch import cast_back_from_e5m6
+from tests.conftest import IS_HIP
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -48,7 +49,9 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
         for num_tokens in generate_num_tokens(is_benchmark=is_benchmark)
         for hidden_size in generate_hidden_sizes()
         for num_per_channels in (hidden_size, )
-        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in [(False, True, False), (True, True, True)]
+        for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in (
+            [(False, True, False)] if IS_HIP else [(False, True, False), (True, True, True)]
+        )
         for out_dtype in (torch.bfloat16, torch.float32)
     ]
 
