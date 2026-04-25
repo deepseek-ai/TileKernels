@@ -1,4 +1,5 @@
 import hashlib
+import random
 
 import pytest
 import torch
@@ -15,4 +16,5 @@ def seed(request):
     ).hexdigest(), 16) % (2**31)
     seed = base + node_hash
     torch.manual_seed(seed)
+    random.seed(seed)
     return seed
