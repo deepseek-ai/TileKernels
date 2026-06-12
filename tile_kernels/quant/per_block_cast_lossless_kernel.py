@@ -88,10 +88,13 @@ def get_per_block_cast_lossless_kernel(
 
             # Load scaling factor of x to fragment
             T.fill(x_sf_fragment, 0)
+            num_in_sf_blocks_m = T.ceildiv(num_tokens, in_config.sf_block[0])
+            num_in_sf_blocks_k = T.ceildiv(hidden, in_config.sf_block[1])
             for i, j in T.Parallel(num_in_sf_per_block_m, num_in_sf_per_block_k):
                 m_idx = pid_token * block_m // in_config.sf_block[0] + i
                 k_idx = pid_hidden * block_k // in_config.sf_block[1] + j
-                x_sf_fragment[i, j] = load_sf(x_sf, m_idx, k_idx, in_config)
+                if m_idx < num_in_sf_blocks_m and k_idx < num_in_sf_blocks_k:
+                    x_sf_fragment[i, j] = load_sf(x_sf, m_idx, k_idx, in_config)
 
             # Alloc fragments
             x_sf_uint32_fragment = T.alloc_fragment((num_in_sf_per_block_m, num_in_sf_per_block_k), T.uint32)
@@ -137,14 +140,17 @@ def get_per_block_cast_lossless_kernel(
                 x_out_fragment[i, j] = T.cast(T.float32(x_in_shared[i, j]) * sf, out_config.dtype)
 
             # Store scaling factor back to global memory
+            num_out_sf_blocks_m = T.ceildiv(num_tokens, out_config.sf_block[0])
+            num_out_sf_blocks_k = T.ceildiv(hidden, out_config.sf_block[1])
             for i, j in T.Parallel(num_out_sf_per_block_m, num_out_sf_per_block_k):
                 sf_m_idx = pid_token * num_out_sf_per_block_m + i
                 sf_k_idx = pid_hidden * num_out_sf_per_block_k + j
-                if out_config.use_packed_ue8m0:
-                    sf = T.uint8(out_sf_uint32_fragment[i, j])
-                else:
-                    sf = transform_sf_to_fp32(out_sf_uint32_fragment[i, j])
-                store_sf(out_sf, sf, sf_m_idx, sf_k_idx, out_config)
+                if sf_m_idx < num_out_sf_blocks_m and sf_k_idx < num_out_sf_blocks_k:
+                    if out_config.use_packed_ue8m0:
+                        sf = T.uint8(out_sf_uint32_fragment[i, j])
+                    else:
+                        sf = transform_sf_to_fp32(out_sf_uint32_fragment[i, j])
+                    store_sf(out_sf, sf, sf_m_idx, sf_k_idx, out_config)
 
             T.copy(x_out_fragment, out[pid_token * block_m: (pid_token + 1) * block_m, pid_hidden * block_k: (pid_hidden + 1) * block_k])
 

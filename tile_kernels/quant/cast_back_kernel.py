@@ -60,11 +60,16 @@ def get_cast_back_kernel(
             out_fragment = T.alloc_fragment((TILE_M, TILE_K), out_dtype)
 
             T.copy(x[pid_token * TILE_M, pid_hidden * TILE_K], x_shared, disable_tma=True)
+            num_sf_token_blocks = T.ceildiv(num_tokens, num_per_tokens)
+            num_sf_channel_blocks = T.ceildiv(hidden, num_per_channels)
             for i, j in T.Parallel(T.ceildiv(TILE_M, num_per_tokens), T.ceildiv(TILE_K, num_per_channels)):
                 token_index = pid_token * TILE_M // num_per_tokens + i
                 channel_index = pid_hidden * TILE_K // num_per_channels + j
-                sf = load_sf(x_sf, token_index, channel_index, in_config)
-                sf_shared[i, j] = transform_sf(sf, in_config)
+                if token_index < num_sf_token_blocks and channel_index < num_sf_channel_blocks:
+                    sf = load_sf(x_sf, token_index, channel_index, in_config)
+                    sf_shared[i, j] = transform_sf(sf, in_config)
+                else:
+                    sf_shared[i, j] = 0
 
             for i, j in T.Parallel(TILE_M, TILE_K):
                 out_fragment[i, j] = x_shared[i, j] * sf_shared[i // num_per_tokens, j // num_per_channels]

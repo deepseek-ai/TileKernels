@@ -115,7 +115,8 @@ def get_per_token_cast_kernel(
                     # Store SF
                     m_idx = pid_token * block_m + i
                     k_idx = pid_hidden * num_groups + j
-                    store_sf(out_sf, sf, m_idx, k_idx, out_config)
+                    if m_idx < num_tokens:
+                        store_sf(out_sf, sf, m_idx, k_idx, out_config)
                     sf_inv_fragment[i, j] = sf_inv
 
                 # Store casted values
@@ -131,7 +132,7 @@ def get_per_token_cast_kernel(
                         sf = load_sf(out_sf, pid_token * block_m + i, pid_hidden * num_groups + j, out_config)
                         sf_inv_fragment[i, j] = 1 / sf
                 else:
-                    amax_fragment = T.alloc_fragment((block_m, num_groups), in_config.dtype)
+                    amax_fragment = T.alloc_fragment((block_m, num_groups), T.float32)
                     x_fragment_reshaped = T.reshape(x_fragment, [block_m, num_groups, num_per_channels])
                     # Reduce SF
                     T.reduce_absmax(x_fragment_reshaped, amax_fragment, dim=2)
@@ -142,7 +143,8 @@ def get_per_token_cast_kernel(
                         # Store SF
                         m_idx = pid_token * block_m + i
                         k_idx = pid_hidden * num_groups + j
-                        store_sf(out_sf, sf, m_idx, k_idx, out_config)
+                        if m_idx < num_tokens:
+                            store_sf(out_sf, sf, m_idx, k_idx, out_config)
                         sf_inv_fragment[i, j] = sf_inv
 
                 # Store casted values

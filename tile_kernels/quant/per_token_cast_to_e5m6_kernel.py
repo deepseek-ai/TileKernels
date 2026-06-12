@@ -119,7 +119,7 @@ def get_per_token_cast_to_e5m6_kernel(
             # Copy input into registers
             T.copy(x[pid_token * block_m, pid_hidden * block_k], x_fragment)
 
-            amax_fragment = T.alloc_fragment((block_m, num_groups), in_config.dtype)
+            amax_fragment = T.alloc_fragment((block_m, num_groups), T.float32)
             x_fragment_reshaped = T.reshape(x_fragment, [block_m, num_groups, num_per_channels])
             # Reduce SF
             T.reduce_absmax(x_fragment_reshaped, amax_fragment, dim=2)
@@ -130,7 +130,8 @@ def get_per_token_cast_to_e5m6_kernel(
                 # Store SF
                 m_idx = pid_token * block_m + i
                 k_idx = pid_hidden * num_groups + j
-                store_sf(out_sf, sf, m_idx, k_idx, out_config)
+                if m_idx < num_tokens:
+                    store_sf(out_sf, sf, m_idx, k_idx, out_config)
                 sf_inv_fragment[i, j] = sf_inv
 
             T.annotate_layout({
@@ -150,8 +151,11 @@ def get_per_token_cast_to_e5m6_kernel(
                 for j in T.serial(8):
                     in_local[j] = out_fragment[x, y * 8 + j]
                 float_to_e5m6(in_local, out_local)
-                for j in T.serial(3):
-                    out[pid_token * block_m + x, pid_hidden * (block_k // 8 * 3) + y * 3 + j] = out_local[j]
+                m_idx = pid_token * block_m + x
+                k_idx = pid_hidden * block_k + y * 8
+                if m_idx < num_tokens and k_idx < hidden:
+                    for j in T.serial(3):
+                        out[m_idx, (k_idx // 8) * 3 + j] = out_local[j]
 
     return per_token_cast_to_e5m6_kernel
 
