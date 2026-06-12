@@ -104,6 +104,7 @@ def get_get_fused_mapping_kernel(
             T.sync_grid()
 
             cumsum_shared = T.alloc_shared((num_threads,), T.int32)
+            cumsum_shared[thread_idx] = 0
             expert_num_elements = T.alloc_var(T.int32, init=0)
             expert_num_elements_aligned = T.alloc_var(T.int32, init=0)
             prefix_expert_num_elements = T.alloc_var(T.int32, init=0)
@@ -143,7 +144,9 @@ def get_get_fused_mapping_kernel(
             lane_mask_rev = ~lane_mask
             for i in T.serial(start + lane_idx, aligned_end, warp_size):
                 T.assume(0 <= i)
-                expert_idx = T.Select(i < numel, T.int32(topk_idx_1d[i]), -1)
+                expert_idx = T.alloc_var(T.int32, init=-1)
+                if i < numel:
+                    expert_idx = T.int32(topk_idx_1d[i])
                 mask = T.call_extern(T.uint32, '__match_any_sync', 0xFFFFFFFF, expert_idx)
                 count = T.popcount(mask & lane_mask)
 
@@ -201,7 +204,9 @@ def get_fused_mapping(
     should_sync = False
     if num_expanded_tokens == 0 and not force_no_sync:
         should_sync = True
-        num_expanded_tokens = (num_tokens * num_topk + (alignment - 1) * num_experts) // alignment * alignment
+        # Each expert range is aligned independently, so reserve the rounded-up
+        # upper bound before trimming with num_tokens_per_expert.
+        num_expanded_tokens = align(num_tokens * num_topk + (alignment - 1) * num_experts, alignment)
 
     # Allocate output
     num_sms = get_num_sms()

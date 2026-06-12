@@ -56,13 +56,15 @@ def get_expand_to_fused_kernel(
             if pid_token < num_expanded_tokens:
                 if pos_to_expert[pid_token] < 0:
                     for i in T.Parallel(hidden_aligned):
-                        expanded_x[pid_token, i] = 0
+                        if i < hidden:
+                            expanded_x[pid_token, i] = 0
                     if num_per_channels is not None:
                         for i in T.Parallel(hidden_sf_aligned):
-                            if use_tma_aligned_col_major_sf:
-                                expanded_x_sf[i, pid_token] = 0
-                            else:
-                                expanded_x_sf[pid_token, i] = 0
+                            if i < hidden_sf:
+                                if use_tma_aligned_col_major_sf:
+                                    expanded_x_sf[i, pid_token] = 0
+                                else:
+                                    expanded_x_sf[pid_token, i] = 0
 
             if pid_token >= num_tokens:
                 T.thread_return()
@@ -80,13 +82,15 @@ def get_expand_to_fused_kernel(
                 T.assume(pos_local[k] < num_expanded_tokens)
                 if pos_local[k] >= 0:
                     for i in T.Parallel(hidden_aligned):
-                        expanded_x[pos_local[k], i] = x_fragment[i]
+                        if i < hidden:
+                            expanded_x[pos_local[k], i] = x_fragment[i]
                     if num_per_channels is not None:
                         for i in T.Parallel(hidden_sf_aligned):
-                            if use_tma_aligned_col_major_sf:
-                                expanded_x_sf[i, pos_local[k]] = x_sf_fragment[i]
-                            else:
-                                expanded_x_sf[pos_local[k], i] = x_sf_fragment[i]
+                            if i < hidden_sf:
+                                if use_tma_aligned_col_major_sf:
+                                    expanded_x_sf[i, pos_local[k]] = x_sf_fragment[i]
+                                else:
+                                    expanded_x_sf[pos_local[k], i] = x_sf_fragment[i]
 
     return expand_to_fused_kernel
 
