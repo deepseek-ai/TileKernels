@@ -12,15 +12,22 @@ from tile_kernels.mhc.norm_fn_kernel import (
 )
 
 
+def _mhc_fn_normw_merge_impl(
+    mhc_fn: torch.Tensor,
+    mhc_norm_weight: torch.Tensor,
+) -> torch.Tensor:
+    out_fn = torch.empty_like(mhc_fn)
+    _mhc_fn_normw_merge_fwd(*mhc_fn.shape)(mhc_fn, mhc_norm_weight, out_fn)
+    return out_fn
+
+
 class _MHCFnNormwMerge(torch.autograd.Function):
     @staticmethod
     def forward(ctx: '_MHCFnNormwMerge', fn: torch.Tensor, normw: torch.Tensor) -> torch.Tensor:
         ctx.fn_main_grad = getattr(fn, 'main_grad', None)
         ctx.normw_main_grad = getattr(normw, 'main_grad', None)
         ctx.save_for_backward(fn, normw)
-        out_fn = torch.empty_like(fn)
-        _mhc_fn_normw_merge_fwd(*fn.shape)(fn, normw, out_fn)
-        return out_fn
+        return _mhc_fn_normw_merge_impl(fn, normw)
 
     @staticmethod
     def backward(ctx: '_MHCFnNormwMerge', out_fn_grad: torch.Tensor) -> tuple[None, None]:
@@ -170,6 +177,19 @@ class MHCPreNormFn(torch.autograd.Function):
         return x_grad, fn_grad, None, None, None, None
 
 
+def mhc_fn_normw_merge(
+    mhc_fn: torch.Tensor,
+    mhc_norm_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    if mhc_norm_weight is None:
+        return mhc_fn
+
+    if not torch.is_grad_enabled():
+        return _mhc_fn_normw_merge_impl(mhc_fn, mhc_norm_weight)
+
+    return _MHCFnNormwMerge.apply(mhc_fn, mhc_norm_weight)
+
+
 def mhc_pre_norm_fn(
     residual: torch.Tensor,
     mhc_fn: torch.Tensor,
@@ -178,8 +198,7 @@ def mhc_pre_norm_fn(
     fuse_grad_acc: bool = True,
     n_splits: int = 16,
 ) -> torch.Tensor:
-    if mhc_norm_weight is not None:
-        mhc_fn = _MHCFnNormwMerge.apply(mhc_fn, mhc_norm_weight)
+    mhc_fn = mhc_fn_normw_merge(mhc_fn, mhc_norm_weight)
     return MHCPreNormFn.apply(
         residual,
         mhc_fn,
