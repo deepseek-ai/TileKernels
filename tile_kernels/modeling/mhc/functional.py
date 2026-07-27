@@ -1,11 +1,9 @@
 import torch
 import torch.nn.functional as F
 
-from tile_kernels.mhc.norm_fn_kernel import _mhc_fn_normw_merge_fwd
-
 from .ops.expand import expand_to_mhc
 from .ops.head_compute_mix import mhc_head_compute_mix
-from .ops.norm_fn import mhc_pre_norm_fn
+from .ops.norm_fn import mhc_pre_norm_fn, mhc_fn_normw_merge
 from .ops.post import mhc_post
 from .ops.pre_apply_mix import mhc_pre_apply_mix
 from .ops.pre_big_fuse import mhc_pre_big_fuse
@@ -69,10 +67,9 @@ def mhc_pre(
         ctx: opaque tuple (post_mix, comb_mix) to pass to mhc_post
     """
     if not torch.is_grad_enabled():
-        if norm_weight is not None:
-            merged_fn = torch.empty_like(fn)
-            _mhc_fn_normw_merge_fwd(*fn.shape)(fn, norm_weight, merged_fn)
-            fn = merged_fn
+        # mhc_pre_big_fuse does not accept norm_weight as an argument.
+        # We must pre-fuse norm_weight into fn before calling the kernel.
+        fn = mhc_fn_normw_merge(fn, norm_weight)
         post_mix, comb_mix, layer_input = mhc_pre_big_fuse(
             residual,
             fn,
