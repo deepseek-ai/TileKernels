@@ -7,7 +7,7 @@ from tilelang.contrib import nvcc
 try:
     # TileLang >= 0.1.12
     from tilelang.backend.target import determine_target
-except ModuleNotFoundError:
+except ImportError:
     # TileLang <= 0.1.11
     from tilelang.utils.target import determine_target
 
