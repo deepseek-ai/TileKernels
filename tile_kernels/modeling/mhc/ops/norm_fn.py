@@ -185,7 +185,7 @@ def mhc_fn_normw_merge(
         return mhc_fn
 
     if not torch.is_grad_enabled():
-        return _merge_mhc_fn_norm_weight_forward(mhc_fn, mhc_norm_weight)
+        return _mhc_fn_normw_merge_impl(mhc_fn, mhc_norm_weight)
 
     return _MHCFnNormwMerge.apply(mhc_fn, mhc_norm_weight)
 

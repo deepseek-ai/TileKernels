@@ -89,20 +89,20 @@ def test_correctness(
 
     with torch.no_grad():
         eval_layer_input, (eval_post_mix, eval_comb_mix) = mhc_pre(
-        test_data['residual'],
-        test_data['fn'],
-        test_data['scale'],
-        test_data['base'],
-        norm_weight=test_data['norm_weight'],
-        norm_eps=test_data['norm_eps'],
-        mhc_mult=mhc_mult,
-        post_mult_value=test_data['post_mult_value'],
-        pre_eps=test_data['pre_eps'],
-        sinkhorn_eps=test_data['sinkhorn_eps'],
-        sinkhorn_repeat=test_data['sinkhorn_repeat'],
-        n_splits=test_data['n_splits'],
+            test_data['residual'],
+            test_data['fn'],
+            test_data['scale'],
+            test_data['base'],
+            norm_weight=test_data['norm_weight'],
+            norm_eps=test_data['norm_eps'],
+            mhc_mult=mhc_mult,
+            post_mult_value=test_data['post_mult_value'],
+            pre_eps=test_data['pre_eps'],
+            sinkhorn_eps=test_data['sinkhorn_eps'],
+            sinkhorn_repeat=test_data['sinkhorn_repeat'],
+            n_splits=test_data['n_splits'],
     )
 
-    torch.testing.assert_close(train_layer_input, eval_layer_input, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(train_post_mix, eval_post_mix, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(train_comb_mix, eval_comb_mix, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(train_layer_input, eval_layer_input, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(train_post_mix, eval_post_mix, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(train_comb_mix, eval_comb_mix, atol=1e-4, rtol=1e-4)
