@@ -132,8 +132,10 @@ def get_per_channel_cast_fused_kernel(
                         out_local[j] = in_local[j] * sf_invs_local[i] * amax_local[j]
                     else:
                         out_local[j] = in_local[j] * amax_local[j]
-                for j in T.vectorized(VEC_K):
-                    out[i + m_offset, j + k_offset] = out_local[j]
+                out_row = i + m_offset
+                if out_row < num_tokens_out:
+                    for j in T.vectorized(VEC_K):
+                        out[out_row, j + k_offset] = out_local[j]
 
     return per_channel_cast_fused_kernel
 
