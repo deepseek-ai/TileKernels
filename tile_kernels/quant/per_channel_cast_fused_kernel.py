@@ -71,8 +71,12 @@ def get_per_channel_cast_fused_kernel(
             T.assume(num_tokens_out % 128 == 0 or (with_expand and num_tokens_out % 16 == 0))
             if with_expand:
                 tmp = T.alloc_var(T.int32)
-                if k_id < VEC_M:
-                    tmp = pos_to_token[k_id + m_offset]
+                # Invalid tail rows remain -1 and follow the existing zero-fill path,
+                # so they do not participate in the amax reduction.
+                tmp = -1
+                row = k_id + m_offset
+                if k_id < VEC_M and row < num_tokens_out:
+                    tmp = pos_to_token[row]
 
                 for i in T.serial(VEC_M):
                     pos_to_token_local[i] = T.shfl_sync(tmp, i)
