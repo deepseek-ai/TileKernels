@@ -13,7 +13,7 @@ from tile_kernels.torch.per_channel_cast_fused import per_channel_cast_fused as 
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
 
 
-def generate_test_data(params):
+def generate_test_data(params, alignment=128):
     num_send_tokens = params['num_send_tokens']
     num_topk = params['num_topk']
     num_experts = params['num_experts']
@@ -28,7 +28,7 @@ def generate_test_data(params):
         topk_idx = generate_topk_idx(params)
         num_tokens = topk_idx.shape[0]
         _, pos_to_token, _, token_topk_to_pos, _, _, _, _ = (
-            tile_kernels.moe.get_fused_mapping(topk_idx, num_experts, 0, 128)
+            tile_kernels.moe.get_fused_mapping(topk_idx, num_experts, 0, alignment)
         )
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         x = tile_kernels.moe.expand_to_fused(x, token_topk_to_pos, pos_to_token)
@@ -74,8 +74,10 @@ def generate_test_params(is_benchmark: bool) -> list[dict]:
 
 
 @pytest.mark.parametrize('params', generate_test_params(is_benchmark=False), ids=make_param_id)
-def test_per_channel_cast_fused(params):
-    _, _, _, func, func_ref = generate_test_data(params)
+@pytest.mark.parametrize('alignment', [16, 128])
+# use alignment=16 to cover expand tails issues.
+def test_per_channel_cast_fused(params, alignment):
+    _, _, _, func, func_ref = generate_test_data(params, alignment)
 
     x_fp8, x_fp8_sf = func()
     x_fp8_ref, x_fp8_sf_ref = func_ref()
