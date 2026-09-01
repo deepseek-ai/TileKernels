@@ -67,7 +67,7 @@ def dtype_to_str(dtype: torch.dtype) -> str:
     }
 
     if dtype not in mapping:
-        raise ValueError(f'Unsupported dtype: {dtype}. Only fp32, fp16, bf16, e4m3, e5m2, and int8(e2m1) are supported')
+        raise ValueError(f'Unsupported dtype: {dtype}. Only {", ".join(mapping.values())} are supported')
 
     return mapping[dtype]
 
