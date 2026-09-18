@@ -4,7 +4,7 @@ import tilelang
 from tilelang import language as T
 
 from tile_kernels.config import get_num_sms
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 
 
 @tilelang.jit(
@@ -60,10 +60,15 @@ def inplace_unique_group_indices(group_indices: torch.Tensor, num_groups: int) -
 
     num_topk = group_indices.shape[1]
     num_groups_aligned = align(num_groups, 64)
-    kernel = get_inplace_unique_group_indices_kernel(num_topk, num_groups_aligned, get_num_sms())
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    # Compile and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = group_indices.device
+    with get_device_guard(device):
+        kernel = get_inplace_unique_group_indices_kernel(num_topk, num_groups_aligned, get_num_sms(device.index))
 
-    if group_indices.shape[0] > 0:
-        kernel(group_indices)
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
+
+        if group_indices.shape[0] > 0:
+            kernel(group_indices)

@@ -4,7 +4,7 @@ from tilelang import language as T
 from typing import Optional
 import os
 
-from tile_kernels.utils import align, ceil_div
+from tile_kernels.utils import align, ceil_div, get_device_guard
 from tile_kernels.moe.scoring import ScoringFunc, softplus
 from tile_kernels.moe.common import get_topk_group_idx
 
@@ -403,22 +403,26 @@ def top2_sum_gate(
         assert fix_routing_mask.dtype == torch.bool
         assert fix_routing_mask.dim() == 1 and fix_routing_mask.size(0) == num_tokens
 
-    kernel = get_top2_sum_gate_kernel(
-        ScoringFunc.from_str(scoring_func).value,
-        num_topk,
-        num_topk_groups, num_groups,
-        num_routed_experts,
-        mask is not None, fix_routing_mask is not None,
-        unmapped_topk_idx is not None, to_physical_map is not None,
-    )  # fmt: off
+    # Compile and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = logits.device
+    with get_device_guard(device):
+        kernel = get_top2_sum_gate_kernel(
+            ScoringFunc.from_str(scoring_func).value,
+            num_topk,
+            num_topk_groups, num_groups,
+            num_routed_experts,
+            mask is not None, fix_routing_mask is not None,
+            unmapped_topk_idx is not None, to_physical_map is not None,
+        )  # fmt: off
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    kernel(logits, bias,
-           mask, fix_routing_mask, to_physical_map, logical_count,
-           topk_idx, unmapped_topk_idx, topk_weights,
-           num_extra_experts, routed_scaling_factor,
-           ep_rank, num_ep_ranks, tp_rank, num_tp_ranks)  # fmt: off
+        kernel(logits, bias,
+               mask, fix_routing_mask, to_physical_map, logical_count,
+               topk_idx, unmapped_topk_idx, topk_weights,
+               num_extra_experts, routed_scaling_factor,
+               ep_rank, num_ep_ranks, tp_rank, num_tp_ranks)  # fmt: off
 
     return topk_idx, topk_weights

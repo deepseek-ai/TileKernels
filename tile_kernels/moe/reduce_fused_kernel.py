@@ -4,6 +4,7 @@ import tilelang
 from tilelang import language as T
 from typing import Optional, Union
 from tile_kernels.quant.common import *
+from tile_kernels.utils import get_device_guard
 
 
 @tilelang.jit(
@@ -108,29 +109,42 @@ def reduce_fused(
     else:
         assert sf is None, 'Only FP8 output supports sf.'
 
+    # Allocate (when needed) and launch on the device of the input tensor, which is
+    # not necessarily the current CUDA device.
+    device = x.device
+    assert token_topk_to_pos.device == device, f'token_topk_to_pos is on {token_topk_to_pos.device}, expected {device}'
+    if topk_weights is not None:
+        assert topk_weights.device == device, f'topk_weights is on {topk_weights.device}, expected {device}'
+    if x_sf is not None:
+        assert x_sf.device == device, f'x_sf is on {x_sf.device}, expected {device}'
+    if sf is not None:
+        assert sf.device == device, f'sf is on {sf.device}, expected {device}'
+
     if out is not None:
         num_tokens_, hidden_ = out.shape
         assert num_tokens == num_tokens_ and hidden == hidden_
+        assert out.device == device, f'out is on {out.device}, expected {device}'
     else:
-        out = torch.empty((num_tokens, hidden), dtype=out_dtype, device='cuda')
+        out = torch.empty((num_tokens, hidden), dtype=out_dtype, device=device)
 
     if x_sf is not None:
         num_expanded_tokens_ = x_sf.shape[0]
         assert num_expanded_tokens == num_expanded_tokens_
 
-    kernel = get_reduce_fused_kernel(
-        hidden,
-        num_topk,
-        T.dtype(in_dtype),
-        T.dtype(out_dtype),
-        sf is not None,
-        topk_weights is not None,
-        x_sf is not None,
-    )
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    with get_device_guard(device):
+        kernel = get_reduce_fused_kernel(
+            hidden,
+            num_topk,
+            T.dtype(in_dtype),
+            T.dtype(out_dtype),
+            sf is not None,
+            topk_weights is not None,
+            x_sf is not None,
+        )
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    if num_tokens > 0:
-        kernel(x, topk_weights, token_topk_to_pos, out, sf, x_sf)
+        if num_tokens > 0:
+            kernel(x, topk_weights, token_topk_to_pos, out, sf, x_sf)
 
     return out

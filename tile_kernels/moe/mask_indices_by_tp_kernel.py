@@ -3,6 +3,8 @@ import torch
 import tilelang
 from tilelang import language as T
 
+from tile_kernels.utils import get_device_guard
+
 
 @tilelang.jit(
     pass_configs={
@@ -61,13 +63,16 @@ def mask_indices_by_tp(indices: torch.Tensor, n: int, num_ep_ranks: int, tp_rank
     num_topk = indices.shape[1]
     per_gpu = n // num_ep_ranks
     per_dp = num_tp_ranks * per_gpu
-    kernel = get_mask_indices_by_tp_kernel(num_topk, T.dtype(indices.dtype))
+    # Compile and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    with get_device_guard(indices.device):
+        kernel = get_mask_indices_by_tp_kernel(num_topk, T.dtype(indices.dtype))
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    masked_indices = torch.empty_like(indices)
-    if indices.shape[0] > 0:
-        kernel(indices, masked_indices, per_gpu, per_dp, num_tp_ranks, tp_rank)
+        masked_indices = torch.empty_like(indices)
+        if indices.shape[0] > 0:
+            kernel(indices, masked_indices, per_gpu, per_dp, num_tp_ranks, tp_rank)
 
     return masked_indices

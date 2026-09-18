@@ -4,7 +4,7 @@ import tilelang
 from tilelang import language as T
 from typing import Optional
 
-from tile_kernels.utils import align, ceil_div
+from tile_kernels.utils import align, ceil_div, get_device_guard
 from tile_kernels.quant.common import QuantTensor
 
 
@@ -112,20 +112,24 @@ def expand_to_fused(x: torch.Tensor, token_topk_to_pos: torch.Tensor, pos_to_exp
     num_expanded_tokens = pos_to_expert.shape[0]
     assert num_tokens == num_tokens_
 
-    kernel = get_expand_to_fused_kernel(
-        hidden,
-        num_topk,
-        None, None, None,
-        T.dtype(x.dtype),
-        T.dtype(x.dtype),
-    )
+    device = x.device
+    assert token_topk_to_pos.device == device and pos_to_expert.device == device
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    with get_device_guard(device):
+        kernel = get_expand_to_fused_kernel(
+            hidden,
+            num_topk,
+            None, None, None,
+            T.dtype(x.dtype),
+            T.dtype(x.dtype),
+        )
 
-    out = torch.empty((num_expanded_tokens, hidden), dtype=x.dtype, device='cuda')
-    if num_tokens > 0:
-        kernel(x, None, out, None, token_topk_to_pos, pos_to_expert)
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
+
+        out = torch.empty((num_expanded_tokens, hidden), dtype=x.dtype, device=device)
+        if num_tokens > 0:
+            kernel(x, None, out, None, token_topk_to_pos, pos_to_expert)
 
     return out
 
@@ -176,25 +180,33 @@ def expand_to_fused_with_sf(
 
     assert hidden_sf == x_sf.shape[1]
 
-    kernel = get_expand_to_fused_kernel(
-        hidden,
-        num_topk,
-        num_per_channels,
-        use_tma_aligned_col_major_sf,
-        use_packed_ue8m0,
-        T.dtype(x.dtype),
-        T.dtype(x_sf.dtype),
-    )
+    device = x.device
+    assert x_sf.device == device and token_topk_to_pos.device == device and pos_to_expert.device == device
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    with get_device_guard(device):
+        kernel = get_expand_to_fused_kernel(
+            hidden,
+            num_topk,
+            num_per_channels,
+            use_tma_aligned_col_major_sf,
+            use_packed_ue8m0,
+            T.dtype(x.dtype),
+            T.dtype(x_sf.dtype),
+        )
 
-    out = torch.empty((num_expanded_tokens, hidden), dtype=x.dtype, device='cuda')
-    out_sf = torch.empty((hidden_sf, num_expanded_sf_tokens) if use_tma_aligned_col_major_sf else (num_expanded_tokens, hidden_sf), dtype=x_sf.dtype, device='cuda')
-    out_sf = out_sf[:, :num_expanded_tokens] if use_tma_aligned_col_major_sf else out_sf
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    if num_tokens > 0:
-        kernel(x, x_sf, out, out_sf, token_topk_to_pos, pos_to_expert)
+        out = torch.empty((num_expanded_tokens, hidden), dtype=x.dtype, device=device)
+        out_sf = torch.empty(
+            (hidden_sf, num_expanded_sf_tokens) if use_tma_aligned_col_major_sf else (num_expanded_tokens, hidden_sf),
+            dtype=x_sf.dtype,
+            device=device,
+        )
+        out_sf = out_sf[:, :num_expanded_tokens] if use_tma_aligned_col_major_sf else out_sf
+
+        if num_tokens > 0:
+            kernel(x, x_sf, out, out_sf, token_topk_to_pos, pos_to_expert)
     out_sf = out_sf.T if use_tma_aligned_col_major_sf else out_sf
 
     return out, out_sf

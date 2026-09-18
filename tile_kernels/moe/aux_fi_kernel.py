@@ -2,7 +2,7 @@ import os
 import torch
 import tilelang
 from tilelang import language as T
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 from tile_kernels.config import get_num_sms
 
 
@@ -61,12 +61,17 @@ def aux_fi(topk_idx: torch.Tensor, num_experts: int, num_aux_topk: int) -> torch
     assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
 
     num_topk = topk_idx.shape[1]
-    kernel = get_aux_fi_kernel(num_topk, num_experts, get_num_sms())
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    # Allocate and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = topk_idx.device
+    with get_device_guard(device):
+        kernel = get_aux_fi_kernel(num_topk, num_experts, get_num_sms(device.index))
 
-    out = torch.zeros(num_experts, dtype=torch.float32, device='cuda')
-    kernel(topk_idx, out, num_aux_topk)
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
+
+        out = torch.zeros(num_experts, dtype=torch.float32, device=device)
+        kernel(topk_idx, out, num_aux_topk)
 
     return out

@@ -3,6 +3,8 @@ import torch
 import tilelang
 from tilelang import language as T
 
+from tile_kernels.utils import get_device_guard
+
 
 @tilelang.jit(
     pass_configs={
@@ -56,15 +58,20 @@ def normalize_weight(topk_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     assert topk_weights.dtype == torch.float32
 
     num_tokens, num_topk = topk_weights.shape
-    kernel = get_normalize_weight_kernel(num_topk)
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    # Allocate and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = topk_weights.device
+    with get_device_guard(device):
+        kernel = get_normalize_weight_kernel(num_topk)
 
-    denominator = torch.empty((num_tokens,), dtype=torch.float32, device='cuda')
-    normalized_weights = torch.empty((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    if num_tokens > 0:
-        kernel(topk_weights, denominator, normalized_weights)
+        denominator = torch.empty((num_tokens,), dtype=torch.float32, device=device)
+        normalized_weights = torch.empty((num_tokens, num_topk), dtype=torch.float32, device=device)
+
+        if num_tokens > 0:
+            kernel(topk_weights, denominator, normalized_weights)
 
     return (denominator, normalized_weights)

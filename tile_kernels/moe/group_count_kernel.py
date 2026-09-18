@@ -4,7 +4,7 @@ import tilelang
 from tilelang import language as T
 
 from tile_kernels.config import get_num_sms
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 
 
 @tilelang.jit(
@@ -58,12 +58,16 @@ def group_count(group_idx: torch.Tensor, num_groups: int) -> torch.Tensor:
     """
     assert group_idx.dim() == 2 and group_idx.is_contiguous()
 
-    kernel = get_group_count_kernel(group_idx.shape[1], num_groups, get_num_sms())
+    # Allocate and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = group_idx.device
+    with get_device_guard(device):
+        kernel = get_group_count_kernel(group_idx.shape[1], num_groups, get_num_sms(device.index))
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    out = torch.zeros(num_groups, dtype=torch.int32, device='cuda')
-    kernel(group_idx, out)
+        out = torch.zeros(num_groups, dtype=torch.int32, device=device)
+        kernel(group_idx, out)
 
     return out

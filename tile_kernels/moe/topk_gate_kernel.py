@@ -4,7 +4,7 @@ import tilelang
 import torch
 from tilelang import language as T
 
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 
 
 @tilelang.jit(
@@ -81,10 +81,13 @@ def topk_gate(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
     if num_tokens == 0:
         return topk_idx
 
-    kernel = get_topk_gate_kernel(num_experts, num_topk)
+    # Compile and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    with get_device_guard(scores.device):
+        kernel = get_topk_gate_kernel(num_experts, num_topk)
 
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    kernel(scores, topk_idx)
+        kernel(scores, topk_idx)
     return topk_idx

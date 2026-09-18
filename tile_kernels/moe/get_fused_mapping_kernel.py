@@ -4,7 +4,7 @@ import tilelang
 from tilelang import language as T
 from tile_kernels.config import get_num_sms
 
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 
 
 @T.macro
@@ -203,30 +203,33 @@ def get_fused_mapping(
         should_sync = True
         num_expanded_tokens = (num_tokens * num_topk + (alignment - 1) * num_experts) // alignment * alignment
 
-    # Allocate output
-    num_sms = get_num_sms()
-    pos_to_expert = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device='cuda')
-    pos_to_token = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device='cuda')
-    pos_to_token_topk = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device='cuda')
-    token_topk_to_pos = torch.empty((num_tokens, num_topk), dtype=torch.int32, device='cuda')
-    expert_start = torch.empty((num_experts, ), dtype=torch.int32, device='cuda')
-    expert_end = torch.empty((num_experts, ), dtype=torch.int32, device='cuda')
-    num_tokens_per_expert = torch.empty((num_experts, ), dtype=torch.int32, device='cuda')
-    num_experts_per_sm = torch.empty((num_sms, num_experts), dtype=torch.int32, device='cuda')
+    # Allocate output and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    device = topk_idx.device
+    with get_device_guard(device):
+        num_sms = get_num_sms(device.index)
+        pos_to_expert = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device=device)
+        pos_to_token = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device=device)
+        pos_to_token_topk = torch.empty((num_expanded_tokens, ), dtype=torch.int32, device=device)
+        token_topk_to_pos = torch.empty((num_tokens, num_topk), dtype=torch.int32, device=device)
+        expert_start = torch.empty((num_experts, ), dtype=torch.int32, device=device)
+        expert_end = torch.empty((num_experts, ), dtype=torch.int32, device=device)
+        num_tokens_per_expert = torch.empty((num_experts, ), dtype=torch.int32, device=device)
+        num_experts_per_sm = torch.empty((num_sms, num_experts), dtype=torch.int32, device=device)
 
-    # Get kernel and launch
-    mapping_kernel = get_get_fused_mapping_kernel(num_experts, num_topk, alignment, num_sms)
-    mapping_kernel(
-        topk_idx,
-        pos_to_expert,
-        pos_to_token,
-        pos_to_token_topk,
-        token_topk_to_pos,
-        expert_start,
-        expert_end,
-        num_tokens_per_expert,
-        num_experts_per_sm,
-    )
+        # Get kernel and launch
+        mapping_kernel = get_get_fused_mapping_kernel(num_experts, num_topk, alignment, num_sms)
+        mapping_kernel(
+            topk_idx,
+            pos_to_expert,
+            pos_to_token,
+            pos_to_token_topk,
+            token_topk_to_pos,
+            expert_start,
+            expert_end,
+            num_tokens_per_expert,
+            num_experts_per_sm,
+        )
     if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
         print(mapping_kernel.get_kernel_source())
 

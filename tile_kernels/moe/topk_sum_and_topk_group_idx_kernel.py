@@ -5,7 +5,7 @@ import torch
 from tilelang import language as T
 
 from tile_kernels.moe.common import get_topk_group_idx
-from tile_kernels.utils import align
+from tile_kernels.utils import align, get_device_guard
 
 
 @tilelang.jit(
@@ -90,13 +90,17 @@ def topk_sum_and_topk_group_idx(scores: torch.Tensor, num_topk_sum: int, num_top
     num_tokens, num_groups, num_experts_per_group = scores.shape
     assert num_topk_sum <= num_experts_per_group and num_topk_sum in (1, 2) and num_topk_groups <= num_groups
 
-    kernel = get_topk_sum_and_topk_group_idx_kernel(num_groups, num_experts_per_group, num_topk_groups, num_topk_sum)
-    if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
-        print(kernel.get_kernel_source())
+    # Compile and launch on the device of the input tensor, which is not
+    # necessarily the current CUDA device.
+    with get_device_guard(scores.device):
+        kernel = get_topk_sum_and_topk_group_idx_kernel(num_groups, num_experts_per_group, num_topk_groups, num_topk_sum)
+        if int(os.getenv('TK_PRINT_KERNEL_SOURCE', 0)):
+            print(kernel.get_kernel_source())
 
-    topk_group_idx = torch.empty(num_tokens, num_topk_groups, dtype=torch.int64, device=scores.device)
-    if num_tokens == 0:
-        return topk_group_idx
+        topk_group_idx = torch.empty(num_tokens, num_topk_groups, dtype=torch.int64, device=scores.device)
+        if num_tokens == 0:
+            return topk_group_idx
 
-    kernel(scores.view(num_tokens, -1), topk_group_idx)
+        kernel(scores.view(num_tokens, -1), topk_group_idx)
+
     return topk_group_idx
