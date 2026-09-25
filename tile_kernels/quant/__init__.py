@@ -9,3 +9,4 @@ from .per_token_cast_kernel import per_token_cast, per_token_cast_with_precomput
 from .per_block_cast_kernel import per_block_cast, per_block_cast_with_precomputed_sf, per_block_cast_with_sf_only
 from .cast_back_kernel import cast_back, per_token_cast_back
 from .per_block_cast_lossless_kernel import per_block_cast_lossless
+from .rmsnorm_forward_and_per_token_cast_kernel import rmsnorm_forward_and_per_token_cast
