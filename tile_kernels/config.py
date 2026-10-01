@@ -1,4 +1,5 @@
 import functools
+import operator
 import torch
 import os
 from tilelang import language as T
@@ -84,7 +85,11 @@ def get_max_ub_per_vector_core(use_simt: bool = True) -> int:
 
 
 def set_token_alignment(token_alignment: int) -> None:
+    """Set a positive integer token alignment, preserving the old value on failure."""
     global _token_alignment
+    token_alignment = operator.index(token_alignment)
+    if token_alignment <= 0:
+        raise ValueError('token_alignment must be a positive integer')
     _token_alignment = token_alignment
 
 
