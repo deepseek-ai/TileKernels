@@ -159,6 +159,32 @@ def get_engram_sinkhorn_step_reduce_kernel_cuda(
     num_batches = 8
     num_rows = ceil_div(num_ctas, num_batches)
 
+    # The reduction stages a (num_rows, blk_d) fp32 buffer per pipeline
+    # stage. Datacenter parts (228 KB shared memory) keep the original
+    # 2-stage pipeline; parts with a smaller budget (consumer Blackwell
+    # SM120: 100 KB) drop to a single stage so the launch fits. The
+    # chunking and accumulation order are unchanged, so results stay
+    # bitwise identical to the 2-stage schedule.
+    num_stages = 2
+    smem_budget = 96 * 1024
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            prop = torch.cuda.get_device_properties(0)
+            optin = getattr(prop, 'shared_memory_per_block_optin', 0)
+            if optin:
+                smem_budget = max(16 * 1024, int(optin) - 4 * 1024)
+    except Exception:
+        pass
+    row_bytes = blk_d * 4
+    if num_rows * row_bytes * num_stages > smem_budget:
+        num_stages = 1
+        max_rows = smem_budget // row_bytes
+        if num_rows > max_rows:
+            num_batches = ceil_div(num_ctas, max_rows)
+            num_rows = ceil_div(num_ctas, num_batches)
+
     @T.prim_func
     def engram_sinkhorn_step_reduce_kernel_cuda(
         col_sumsq_partial: T.Tensor[(num_ctas, head_dim), T.float32],
@@ -171,7 +197,7 @@ def get_engram_sinkhorn_step_reduce_kernel_cuda(
             col_sumsq_frag = T.alloc_fragment((blk_d,), T.float32)
             T.clear(col_sumsq_frag)
 
-            for i_r in T.Pipelined(0, num_batches, num_stages=2):
+            for i_r in T.Pipelined(0, num_batches, num_stages=num_stages):
                 T.copy(
                     col_sumsq_partial[
                         i_r * num_rows : (i_r + 1) * num_rows,
@@ -181,8 +207,12 @@ def get_engram_sinkhorn_step_reduce_kernel_cuda(
                 )
 
                 for i in T.Serial(num_rows):
-                    for j in T.Parallel(blk_d):
-                        col_sumsq_frag[j] += col_sumsq_shared[i, j]
+                    # Static-shape batching rounds num_ctas up to
+                    # num_batches * num_rows; rows past num_ctas exist only
+                    # in that padding and must not contribute to the sum.
+                    if i_r * num_rows + i < num_ctas:
+                        for j in T.Parallel(blk_d):
+                            col_sumsq_frag[j] += col_sumsq_shared[i, j]
 
             T.copy(col_sumsq_frag, col_sumsq[pid * blk_d : (pid + 1) * blk_d])
             if use_pdl:
