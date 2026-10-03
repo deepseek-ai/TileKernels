@@ -4,12 +4,110 @@ import pytest
 import torch
 
 import tile_kernels
-from tile_kernels.config import get_device
+from tile_kernels.config import get_device, is_ascend
 from tile_kernels.testing.numeric import calc_diff, count_bytes
 from tile_kernels.torch import rotary_embedding_ref
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
+
+
+@pytest.mark.skipif(is_ascend(), reason='CUDA-only dtype and rotary dimension support')
+@pytest.mark.parametrize(
+    'dtype,dim,nheads,interleaved',
+    [
+        pytest.param(torch.float16, 32, 1, True, id='fp16-d32-h1-interleaved'),
+        pytest.param(torch.float16, 64, 3, False, id='fp16-d64-h3-neox'),
+        pytest.param(torch.float16, 128, 128, False, id='fp16-d128-h128-neox'),
+        pytest.param(torch.float16, 256, 5, True, id='fp16-d256-h5-interleaved'),
+        pytest.param(torch.bfloat16, 32, 128, False, id='bf16-d32-h128-neox'),
+        pytest.param(torch.bfloat16, 256, 1, True, id='bf16-d256-h1-interleaved'),
+    ],
+)
+def test_rotary_embedding_cuda_extended_dtype_and_dims(dtype, dim, nheads, interleaved):
+    torch.manual_seed(0)
+    device = get_device()
+    seqlen = 17
+
+    query = torch.randn(seqlen, nheads, dim, dtype=dtype, device=device)
+    cos_sin = torch.randn(seqlen, dim, dtype=torch.float32, device=device)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    expected = rotary_embedding_ref(query, cos, sin, interleaved=interleaved)
+
+    result = tile_kernels.transform.apply_rotary(query, cos_sin, interleaved=interleaved)
+
+    assert result is None
+    assert calc_diff(query, expected) <= 1e-8
+
+
+@pytest.mark.skipif(is_ascend(), reason='CUDA-only dtype and rotary dimension support')
+def test_rotary_embedding_cuda_extended_support_4d_query_and_key():
+    torch.manual_seed(0)
+    device = get_device()
+    batch = 2
+    seqlen = 11
+    nheads = 3
+    dim = 32
+    seqlen_offset = 3
+    seqlen_total = 32
+
+    query = torch.randn(batch, seqlen, nheads, dim, dtype=torch.float16, device=device)
+    key = torch.randn_like(query)
+    cos_sin = torch.randn(seqlen_total, dim, dtype=torch.float32, device=device)
+    positions = torch.randint(0, seqlen_total - seqlen_offset, (batch, seqlen), dtype=torch.int64, device=device)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    expected_query = rotary_embedding_ref(
+        query,
+        cos,
+        sin,
+        positions,
+        seqlen_offsets=seqlen_offset,
+        interleaved=True,
+        conjugate=True,
+    )
+    expected_key = rotary_embedding_ref(
+        key,
+        cos,
+        sin,
+        positions,
+        seqlen_offsets=seqlen_offset,
+        interleaved=True,
+        conjugate=True,
+    )
+
+    tile_kernels.transform.apply_rotary(
+        query,
+        cos_sin,
+        key,
+        positions=positions,
+        interleaved=True,
+        conjugate=True,
+        seqlen_offset=seqlen_offset,
+    )
+
+    assert calc_diff(query, expected_query) <= 1e-8
+    assert calc_diff(key, expected_key) <= 1e-8
+
+
+@pytest.mark.parametrize('rotary_slice', [slice(None, 64), slice(-64, None)], ids=['prefix', 'suffix'])
+def test_rotary_embedding_partial_slice_preserves_unrotated_values(rotary_slice):
+    torch.manual_seed(0)
+    device = get_device()
+    seqlen = 17
+    nheads = 3
+    dim = 64
+
+    query = torch.randn(seqlen, nheads, dim + 32, dtype=torch.bfloat16, device=device)
+    original = query.clone()
+    cos_sin = torch.randn(seqlen, dim, dtype=torch.float32, device=device)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    expected_rotary = rotary_embedding_ref(query[..., rotary_slice], cos, sin)
+
+    tile_kernels.transform.apply_rotary(query[..., rotary_slice], cos_sin)
+
+    assert calc_diff(query[..., rotary_slice], expected_rotary) <= 1e-8
+    preserved_slice = slice(64, None) if rotary_slice.start is None else slice(None, -64)
+    torch.testing.assert_close(query[..., preserved_slice], original[..., preserved_slice], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('head_split', [False, True])
