@@ -9,6 +9,13 @@ from tile_kernels.quant.norm_forward_cuda import get_norm_forward_and_per_token_
 from tile_kernels.utils import align
 
 
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if not a.numel() or not b.numel():
+        return False
+    a_start, b_start = a.data_ptr(), b.data_ptr()
+    return a_start < b_start + b.numel() * b.element_size() and b_start < a_start + a.numel() * a.element_size()
+
+
 def norm_forward_and_per_token_cast_impl(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -44,7 +51,8 @@ def norm_forward_and_per_token_cast_impl(
     if weight is not None:
         assert weight.shape == (hidden,) and weight.dtype == x.dtype and weight.device == x.device and weight.is_contiguous()
 
-    assert (fmt, num_per_channels) in [('e4m3', 32), ('bf16', None), ('fp32', None)]
+    valid_quant_groups = (32,) if is_ascend() else (32, 128)
+    assert (fmt == 'e4m3' and num_per_channels in valid_quant_groups) or (fmt, num_per_channels) in [('bf16', None), ('fp32', None)]
     out_config = get_cast_output_config(fmt, (1, num_per_channels or 1), use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0)
     assert out_config.with_sf or out_config.torch_dtype == x.dtype, 'the unquantized output must match the input dtype'
     assert not out_config.with_sf or hidden % num_per_channels == 0
@@ -53,7 +61,7 @@ def norm_forward_and_per_token_cast_impl(
     if mega_moe_sf is not None:
         # INT32 (num_tokens, hidden // 128) view of M-major rows, each row padded per `mega_moe_block_m` tokens
         assert x.ndim == 2 and mega_moe_block_m > 0
-        assert out_config.with_sf and round_sf and hidden % 128 == 0
+        assert out_config.with_sf and num_per_channels == 32 and round_sf and hidden % 128 == 0
         assert mega_moe_sf.device == x.device
         assert mega_moe_sf.dtype == torch.int32 and mega_moe_sf.shape == (num_tokens, hidden // 128) and mega_moe_sf.stride(0) == 1
         num_mega_moe_sf_rows = mega_moe_sf.stride(1)
@@ -182,7 +190,7 @@ def norm_forward_and_per_token_cast(
         weight: Optional (hidden,) tensor matching x.dtype/device; None means unit weight.
         eps: Epsilon added to the mean square before reciprocal square root.
         fmt: Target quantized format (``'e4m3'``).
-        num_per_channels: Must be 32; hidden must be divisible by 32.
+        num_per_channels: Must be 32 on Ascend and 32 or 128 on CUDA; hidden must be divisible by it.
         residual: Optional tensor matching x; residual_out always rounds to x.dtype.
         out_scale: FP32 multiplier applied to weight before the output product.
         use_tma_aligned_col_major_sf: Whether to use TMA-aligned column-major sf factors.
@@ -222,6 +230,40 @@ def norm_forward_and_per_token_cast(
         mega_moe_sf=mega_moe_sf,
         mega_moe_block_m=mega_moe_block_m,
     )
+
+
+def add_rmsnorm_forward_and_per_token_cast(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    fmt: str,
+    num_per_channels: int,
+    use_tma_aligned_col_major_sf: bool = False,
+    round_sf: bool = False,
+    use_packed_ue8m0: bool = False,
+) -> QuantTensor:
+    """Add ``x`` to ``residual`` in place, RMS-normalize, and cast to FP8."""
+    assert x.ndim == 2 and x.is_contiguous() and x.dtype in (torch.bfloat16, torch.float32)
+    assert residual.shape == x.shape and residual.dtype == x.dtype and residual.device == x.device and residual.is_contiguous()
+    assert x.device.type == 'cuda' and not _overlaps(x, residual)
+    assert weight.shape == (x.shape[1],) and weight.dtype == x.dtype and weight.device == x.device and weight.is_contiguous()
+    assert not _overlaps(residual, weight)
+
+    quant_out, _, _, norm_input = norm_forward_and_per_token_cast(
+        x,
+        weight,
+        eps,
+        fmt,
+        num_per_channels,
+        residual=residual,
+        residual_out=residual,
+        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
+        round_sf=round_sf,
+        use_packed_ue8m0=use_packed_ue8m0,
+    )
+    assert norm_input is residual
+    return quant_out
 
 
 def norm_forward(

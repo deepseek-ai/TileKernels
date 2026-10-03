@@ -9,5 +9,5 @@ from .swiglu_backward_kernel import swiglu_backward_and_per_token_cast, swiglu_b
 from .swiglu_forward_kernel import swiglu_forward_and_per_token_cast, swiglu_forward
 from .per_block_cast_lossless_kernel import per_block_cast_lossless
 from .batched_transpose_weight_sf_kernel import batched_transpose_weight_sf
-from .norm_forward_kernel import norm_forward_and_per_token_cast, norm_forward
+from .norm_forward_kernel import add_rmsnorm_forward_and_per_token_cast, norm_forward_and_per_token_cast, norm_forward
 from .norm_backward_kernel import norm_backward

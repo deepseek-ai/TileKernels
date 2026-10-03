@@ -22,7 +22,7 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
 ):
     assert 0 < hidden <= 8192
     assert out_config.with_sf or out_config.dtype == x_dtype
-    assert not out_config.with_sf or out_config.sf_block == (1, 32)
+    assert not out_config.with_sf or out_config.sf_block[0] == 1 and out_config.sf_block[1] in (32, 128)
     assert not with_out_bf16 or out_config.with_sf
 
     # A row is split into 16-byte vectors, thread `row_offset` of the row holds vectors `vi * row_threads + row_offset`
@@ -30,10 +30,18 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
     num_elems_per_thread = 32
     vec_size = math.gcd(16 // x_dtype.bytes, hidden)
     num_vecs = hidden // vec_size
-    row_threads = min(num_threads, max(min(8, tilelang.next_power_of_2(num_vecs)), tilelang.next_power_of_2(ceil_div(hidden, num_elems_per_thread))))
-
     num_per_channels = out_config.sf_block[1]
-    group_lanes = num_per_channels // vec_size
+    group_lanes = num_per_channels // vec_size if out_config.with_sf else 1
+    row_threads = min(
+        num_threads,
+        max(
+            group_lanes,
+            min(8, tilelang.next_power_of_2(num_vecs)),
+            tilelang.next_power_of_2(ceil_div(hidden, num_elems_per_thread)),
+        ),
+    )
+    assert not out_config.with_sf or num_per_channels % vec_size == 0 and row_threads % group_lanes == 0
+
     num_sf_cols = ceil_div(hidden, num_per_channels)
     packed_sf_pad = out_config.use_packed_ue8m0 and out_config.use_tma_aligned_col_major_sf and num_sf_cols % 4 != 0
     sf_inv_dtype = get_sf_inv_dtype(x_dtype, out_config)
@@ -54,7 +62,7 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
     mega_sf_lane_rows = 32
     mega_sf_cols = mega_sf_tile_rows // mega_sf_lane_rows
     if mega_moe_block_m > 0:
-        assert out_config.with_sf and out_config.round_sf and hidden % mega_sf_tile_rows == 0
+        assert out_config.with_sf and num_per_channels == 32 and out_config.round_sf and hidden % mega_sf_tile_rows == 0
     mega_moe_aligned_block_m = align(mega_moe_block_m, mega_sf_tile_rows)
 
     batch = T.dynamic('batch')

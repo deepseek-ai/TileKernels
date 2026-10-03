@@ -179,6 +179,217 @@ def test_norm_forward_and_per_token_cast(params):
     assert_equal(preallocated_sf, sf, check_stride=False)
 
 
+@pytest.mark.parametrize(
+    'dtype,use_tma_aligned_col_major_sf,round_sf,use_packed_ue8m0',
+    [
+        (torch.bfloat16, False, False, False),
+        (torch.float32, True, True, True),
+    ],
+)
+def test_norm_forward_and_per_token_cast_group_128(
+    dtype,
+    use_tma_aligned_col_major_sf,
+    round_sf,
+    use_packed_ue8m0,
+):
+    torch.manual_seed(0)
+    x = torch.randn((17, 640), dtype=dtype, device='cuda')
+    residual = torch.randn_like(x)
+    residual_out = torch.empty_like(x)
+    weight = torch.randn((640,), dtype=dtype, device='cuda')
+    expected_normalized, _, expected_residual = norm_forward_ref(x, weight, 1e-6, residual)
+
+    quant_out, _, _, norm_input = tile_kernels.quant.norm_forward_and_per_token_cast(
+        x,
+        weight,
+        1e-6,
+        'e4m3',
+        128,
+        residual=residual,
+        residual_out=residual_out,
+        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
+        round_sf=round_sf,
+        use_packed_ue8m0=use_packed_ue8m0,
+    )
+    expected_quant = cast(
+        expected_normalized,
+        'e4m3',
+        (1, 128),
+        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
+        round_sf=round_sf,
+        use_packed_ue8m0=use_packed_ue8m0,
+    )
+
+    assert norm_input is residual_out
+    assert_equal(norm_input, expected_residual)
+    assert_equal(quant_out[0], expected_quant[0])
+    if use_packed_ue8m0:
+        quant_out = (quant_out[0], clear_unused_sf(quant_out[1], 640, 128))
+        expected_quant = (expected_quant[0], clear_unused_sf(expected_quant[1], 640, 128))
+    assert_equal(quant_out[1], expected_quant[1])
+
+
+ADD_RMSNORM_CASES = [
+    (0, 512, torch.bfloat16, False, False, False),
+    (17, 512, torch.bfloat16, False, True, False),
+    (17, 640, torch.float32, True, True, True),
+    (3, 640, torch.float32, True, False, False),
+]
+
+
+@pytest.mark.parametrize(
+    'num_tokens,hidden,dtype,use_tma_aligned_col_major_sf,round_sf,use_packed_ue8m0',
+    ADD_RMSNORM_CASES,
+)
+def test_add_rmsnorm_forward_and_per_token_cast(
+    num_tokens,
+    hidden,
+    dtype,
+    use_tma_aligned_col_major_sf,
+    round_sf,
+    use_packed_ue8m0,
+):
+    torch.manual_seed(1)
+    x = torch.randn((num_tokens, hidden), dtype=dtype, device='cuda')
+    residual = torch.randn_like(x)
+    weight = torch.randn((hidden,), dtype=dtype, device='cuda')
+    x_before = x.clone()
+    residual_before = residual.clone()
+    expected_normalized, _, expected_residual = norm_forward_ref(x, weight, 1e-6, residual_before)
+    cast_args = dict(
+        fmt='e4m3',
+        block_size=(1, 128),
+        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
+        round_sf=round_sf,
+        use_packed_ue8m0=use_packed_ue8m0,
+    )
+    expected_quant = cast(expected_normalized, **cast_args)
+
+    quant_out = tile_kernels.quant.add_rmsnorm_forward_and_per_token_cast(
+        x,
+        residual,
+        weight,
+        1e-6,
+        'e4m3',
+        128,
+        use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
+        round_sf=round_sf,
+        use_packed_ue8m0=use_packed_ue8m0,
+    )
+
+    assert_equal(x, x_before)
+    assert_equal(residual, expected_residual)
+    assert_equal(quant_out[0], expected_quant[0])
+    if use_packed_ue8m0:
+        quant_out = (quant_out[0], clear_unused_sf(quant_out[1], hidden, 128))
+        expected_quant = (expected_quant[0], clear_unused_sf(expected_quant[1], hidden, 128))
+    assert_equal(quant_out[1], expected_quant[1])
+
+
+def test_add_rmsnorm_forward_and_per_token_cast_rejects_overlapping_views():
+    storage = torch.randn((3, 512), dtype=torch.bfloat16, device='cuda')
+    weight = torch.ones((512,), dtype=storage.dtype, device=storage.device)
+    with pytest.raises(AssertionError):
+        tile_kernels.quant.add_rmsnorm_forward_and_per_token_cast(
+            storage[:2], storage[1:], weight, 1e-6, 'e4m3', 128,
+        )
+
+    x = torch.randn((2, 512), dtype=torch.bfloat16, device='cuda')
+    residual = torch.randn_like(x)
+    with pytest.raises(AssertionError):
+        tile_kernels.quant.add_rmsnorm_forward_and_per_token_cast(
+            x, residual, residual.view(-1)[128:640], 1e-6, 'e4m3', 128,
+        )
+
+
+def test_add_rmsnorm_forward_and_per_token_cast_rejects_whole_row_scaling():
+    x = torch.randn((2, 640), dtype=torch.float32, device='cuda')
+    residual = torch.randn_like(x)
+    weight = torch.ones((640,), dtype=x.dtype, device=x.device)
+
+    with pytest.raises(AssertionError):
+        tile_kernels.quant.add_rmsnorm_forward_and_per_token_cast(
+            x, residual, weight, 1e-6, 'e4m3', 640,
+        )
+
+
+@pytest.mark.benchmark
+def test_add_rmsnorm_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_record):
+    num_tokens, hidden, eps = 4001, 7168, 1e-6
+    # Zero x keeps the in-place residual stable across timed iterations without timing a reset.
+    x = torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    wrapper_residual = torch.randn_like(x)
+    direct_residual = wrapper_residual.clone()
+    unfused_residual = wrapper_residual.clone()
+    weight = torch.randn((hidden,), dtype=x.dtype, device=x.device)
+    cast_args = dict(
+        fmt='e4m3',
+        num_per_channels=128,
+        use_tma_aligned_col_major_sf=True,
+        round_sf=True,
+        use_packed_ue8m0=True,
+    )
+
+    wrapper = lambda: tile_kernels.quant.add_rmsnorm_forward_and_per_token_cast(
+        x,
+        wrapper_residual,
+        weight,
+        eps,
+        **cast_args,
+    )
+    direct = lambda: tile_kernels.quant.norm_forward_and_per_token_cast(
+        x,
+        weight,
+        eps,
+        residual=direct_residual,
+        residual_out=direct_residual,
+        **cast_args,
+    )[0]
+
+    def unfused():
+        normalized, _, _ = tile_kernels.quant.norm_forward(
+            x,
+            weight,
+            eps,
+            residual=unfused_residual,
+            residual_out=unfused_residual,
+        )
+        return tile_kernels.quant.per_token_cast(normalized, **cast_args)
+
+    for _ in range(10):
+        wrapper()
+        direct()
+        unfused()
+    torch.cuda.synchronize()
+
+    wrapper_out = wrapper()
+    wrapper_us = benchmark_timer(wrapper, warmup=200, rep=100)
+    direct_us = benchmark_timer(direct, warmup=200, rep=100)
+    unfused_us = benchmark_timer(unfused, warmup=200, rep=100)
+    params = {'num_tokens': num_tokens, 'hidden': hidden, 'num_per_channels': 128}
+    bandwidth_gbs = count_bytes(x, wrapper_residual, weight, wrapper_out) / wrapper_us / 1e3
+    benchmark_record(
+        kernel='add_rmsnorm_forward_and_per_token_cast',
+        operation='fwd',
+        params=params,
+        time_us=wrapper_us,
+        bandwidth_gbs=bandwidth_gbs,
+        extras={'direct_us': direct_us, 'unfused_us': unfused_us},
+    )
+    benchmark_record(
+        kernel='norm_forward_and_per_token_cast_alias',
+        operation='fwd',
+        params=params,
+        time_us=direct_us,
+    )
+    benchmark_record(
+        kernel='unfused_norm_forward_per_token_cast',
+        operation='fwd',
+        params=params,
+        time_us=unfused_us,
+    )
+
+
 @pytest.mark.benchmark
 @pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
 def test_norm_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_record, params):
