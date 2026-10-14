@@ -4,6 +4,7 @@ import torch
 
 from tile_kernels.config import get_pdl, is_ascend
 from tile_kernels.moe.moe_topk_gate_backward_cuda import get_moe_topk_gate_backward_kernel_cuda
+from tile_kernels.utils import get_device_guard
 
 
 def moe_topk_gate_backward(
@@ -70,26 +71,28 @@ def moe_topk_gate_backward(
     if num_tokens == 0:
         return grad_logits
 
-    if is_ascend():
-        from tile_kernels.moe.moe_topk_gate_backward_asc import get_moe_topk_gate_backward_kernel_asc
+    # The input tensor decides which GPU this runs on; the current device must not.
+    with get_device_guard(scores.device):
+        if is_ascend():
+            from tile_kernels.moe.moe_topk_gate_backward_asc import get_moe_topk_gate_backward_kernel_asc
 
-        kernel = get_moe_topk_gate_backward_kernel_asc(
-            num_topk,
-            num_routed_experts,
-            aux_exists,
-        )
-    else:
-        kernel = get_moe_topk_gate_backward_kernel_cuda(
-            num_topk,
-            num_routed_experts,
-            aux_exists,
-            use_pdl=get_pdl(),
-        )
+            kernel = get_moe_topk_gate_backward_kernel_asc(
+                num_topk,
+                num_routed_experts,
+                aux_exists,
+            )
+        else:
+            kernel = get_moe_topk_gate_backward_kernel_cuda(
+                num_topk,
+                num_routed_experts,
+                aux_exists,
+                use_pdl=get_pdl(),
+            )
 
-    kernel(
-        scores, topk_idx, topk_weights, grad_topk_weights,
-        mask, grad_scores_sum,
-        grad_logits, routed_scaling_factor,
-    )  # fmt: off
+        kernel(
+            scores, topk_idx, topk_weights, grad_topk_weights,
+            mask, grad_scores_sum,
+            grad_logits, routed_scaling_factor,
+        )  # fmt: off
 
     return grad_logits

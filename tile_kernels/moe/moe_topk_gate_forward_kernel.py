@@ -4,6 +4,7 @@ import torch
 
 from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
 from tile_kernels.moe.moe_topk_gate_forward_cuda import get_moe_topk_gate_forward_kernel_cuda
+from tile_kernels.utils import get_device_guard
 
 
 def moe_topk_gate_forward(
@@ -113,40 +114,43 @@ def moe_topk_gate_forward(
         assert fix_routing_mask.dtype == torch.bool
         assert fix_routing_mask.dim() == 1 and fix_routing_mask.size(0) == num_tokens
 
-    if is_ascend():
-        from tile_kernels.moe.moe_topk_gate_forward_asc import get_moe_topk_gate_forward_kernel_asc
+    # The input tensor decides which GPU this runs on; the current device must not.
+    device_index = logits.device.index
+    with get_device_guard(logits.device):
+        if is_ascend():
+            from tile_kernels.moe.moe_topk_gate_forward_asc import get_moe_topk_gate_forward_kernel_asc
 
-        kernel = get_moe_topk_gate_forward_kernel_asc(
-            num_topk,
-            num_routed_experts,
-            num_shared_experts,
-            to_physical_map.size(1) if to_physical_map is not None else 1,
-            mask is not None, fix_routing_mask is not None,
-            unmapped_topk_idx is not None, to_physical_map is not None,
-            bias_exists, image_token_mask_exists,
-            force_random is not None, scores is not None,
-            get_num_vec_cores(),
-        )  # fmt: off
-    else:
-        kernel = get_moe_topk_gate_forward_kernel_cuda(
-            num_topk,
-            num_routed_experts,
-            mask is not None, fix_routing_mask is not None,
-            unmapped_topk_idx is not None, to_physical_map is not None,
-            bias_exists, image_token_mask_exists,
-            force_random is not None, scores is not None,
-            use_pdl=get_pdl(),
-        )  # fmt: off
+            kernel = get_moe_topk_gate_forward_kernel_asc(
+                num_topk,
+                num_routed_experts,
+                num_shared_experts,
+                to_physical_map.size(1) if to_physical_map is not None else 1,
+                mask is not None, fix_routing_mask is not None,
+                unmapped_topk_idx is not None, to_physical_map is not None,
+                bias_exists, image_token_mask_exists,
+                force_random is not None, scores is not None,
+                get_num_vec_cores(device_index),
+            )  # fmt: off
+        else:
+            kernel = get_moe_topk_gate_forward_kernel_cuda(
+                num_topk,
+                num_routed_experts,
+                mask is not None, fix_routing_mask is not None,
+                unmapped_topk_idx is not None, to_physical_map is not None,
+                bias_exists, image_token_mask_exists,
+                force_random is not None, scores is not None,
+                use_pdl=get_pdl(),
+            )  # fmt: off
 
-    kernel(
-        logits, bias,
-        image_bias, image_token_mask,
-        mask, fix_routing_mask, to_physical_map, logical_count,
-        topk_idx, unmapped_topk_idx, topk_weights, scores,
-        force_random,
-        num_shared_experts, routed_scaling_factor,
-        ep_rank
-    )  # fmt: off
+        kernel(
+            logits, bias,
+            image_bias, image_token_mask,
+            mask, fix_routing_mask, to_physical_map, logical_count,
+            topk_idx, unmapped_topk_idx, topk_weights, scores,
+            force_random,
+            num_shared_experts, routed_scaling_factor,
+            ep_rank
+        )  # fmt: off
 
     return topk_idx, topk_weights
 
