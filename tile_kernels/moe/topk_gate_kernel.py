@@ -2,6 +2,7 @@ import torch
 
 from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
 from tile_kernels.moe.topk_gate_cuda import get_topk_gate_kernel_cuda
+from tile_kernels.utils import get_device_guard
 
 
 def topk_gate(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
@@ -32,12 +33,16 @@ def topk_gate(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
     if num_tokens == 0:
         return topk_idx
 
-    if is_ascend():
-        from tile_kernels.moe.topk_gate_asc import get_topk_gate_kernel_asc
+    # The input tensor decides which GPU this runs on; the current device must not.
+    device_index = scores.device.index
+    with get_device_guard(scores.device):
+        if is_ascend():
+            from tile_kernels.moe.topk_gate_asc import get_topk_gate_kernel_asc
 
-        kernel = get_topk_gate_kernel_asc(num_experts, num_topk, get_num_vec_cores())
-    else:
-        kernel = get_topk_gate_kernel_cuda(num_experts, num_topk, use_pdl=get_pdl())
+            kernel = get_topk_gate_kernel_asc(num_experts, num_topk, get_num_vec_cores(device_index))
+        else:
+            kernel = get_topk_gate_kernel_cuda(num_experts, num_topk, use_pdl=get_pdl())
 
-    kernel(scores, topk_idx)
+        kernel(scores, topk_idx)
+
     return topk_idx

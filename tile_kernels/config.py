@@ -37,13 +37,27 @@ def _validate_quant_fmt(fmt: str) -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def get_device_num_sms() -> int:
+def _get_device_num_sms(device_index: int) -> int:
     if is_ascend():
-        prop = torch.npu.get_device_properties(torch.npu.current_device())
+        prop = torch.npu.get_device_properties(device_index)
         return prop.cube_core_num
     else:
-        prop = torch.cuda.get_device_properties(torch.cuda.current_device())
+        prop = torch.cuda.get_device_properties(device_index)
         return prop.multi_processor_count
+
+
+def _resolve_device_index(device_index: int | None) -> int:
+    # Resolve to a concrete index *before* the cached lookup. Caching under `None` would
+    # pin whichever device happened to be current on the first call and hand its
+    # properties to every other device for the rest of the process.
+    if device_index is None:
+        return torch.npu.current_device() if is_ascend() else torch.cuda.current_device()
+    return device_index
+
+
+def get_device_num_sms(device_index: int | None = None) -> int:
+    """SM count (CUDA) or cube core count (Ascend) of a device; defaults to the current one."""
+    return _get_device_num_sms(_resolve_device_index(device_index))
 
 
 def set_num_sms(num_sms: int) -> None:
@@ -52,10 +66,10 @@ def set_num_sms(num_sms: int) -> None:
     _num_sms = num_sms
 
 
-def get_num_sms() -> int:
+def get_num_sms(device_index: int | None = None) -> int:
     global _num_sms
     if _num_sms == 0:
-        return get_device_num_sms()
+        return get_device_num_sms(device_index)
     return _num_sms
 
 
@@ -67,14 +81,19 @@ get_num_ai_cores = get_num_sms
 get_num_cube_cores = get_num_sms
 
 
-def get_num_vec_cores() -> int:
-    return get_num_sms() * 2
+def get_num_vec_cores(device_index: int | None = None) -> int:
+    return get_num_sms(device_index) * 2
 
 
 @functools.lru_cache(maxsize=None)
-def get_max_smem_per_sm() -> int:
-    prop = torch.cuda.get_device_properties(torch.cuda.current_device())
+def _get_max_smem_per_sm(device_index: int) -> int:
+    prop = torch.cuda.get_device_properties(device_index)
     return prop.shared_memory_per_multiprocessor
+
+
+def get_max_smem_per_sm(device_index: int | None = None) -> int:
+    """Shared memory per SM of a device; defaults to the current one."""
+    return _get_max_smem_per_sm(_resolve_device_index(device_index))
 
 
 @functools.lru_cache(maxsize=None)

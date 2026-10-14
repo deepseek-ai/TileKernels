@@ -1,4 +1,19 @@
+import contextlib
+
 import torch
+
+
+def get_device_guard(device: torch.device):
+    """Return a context manager that makes ``device`` the current CUDA device.
+
+    Needed by the MoE entry points: kernel compilation and launch resolve `cuda` against
+    the current device, not against the device the input tensors already live on.
+    Ascend resolves its core count from an explicit device index instead, so a non-CUDA
+    device is a no-op here.
+    """
+    if device.type == 'cuda':
+        return torch.cuda.device(device)
+    return contextlib.nullcontext()
 
 
 def ceil_div(x: int, y: int) -> int:
