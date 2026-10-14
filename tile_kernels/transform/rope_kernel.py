@@ -19,7 +19,8 @@ def apply_rotary(
 
     Args:
         query: ``[num_tokens, num_heads, rot_dim]`` or
-            ``[batch, seqlen, num_heads, rot_dim]``, bf16/fp32.
+            ``[batch, seqlen, num_heads, rot_dim]``. CUDA supports
+            fp16/bf16/fp32; Ascend supports bf16/fp32.
         cos_sin_cache: ``[seqlen_ro, rot_dim]``, contiguous in the last
             dimension and fp32 — cos in ``[:, :rot_dim // 2]``, sin in
             ``[:, rot_dim // 2:]``.
@@ -32,9 +33,10 @@ def apply_rotary(
         conjugate: apply the inverse rotation.
         seqlen_offset: scalar offset added to positions.
 
-    The kernel only supports ``rot_dim`` values 64 and 128, and accepts
-    tensors whose last dimension equals ``rot_dim``. For example, apply tail
-    partial RoPE with ``query[..., -rot_dim:]``.
+    CUDA supports ``rot_dim`` values 32, 64, 128, and 256; Ascend supports
+    64 and 128. The tensor's last dimension must equal ``rot_dim``. Express
+    partial RoPE with a view such as ``query[..., :rot_dim]`` or
+    ``query[..., -rot_dim:]``.
     """
     assert query.ndim in (3, 4)
     assert isinstance(seqlen_offset, int)
@@ -60,12 +62,13 @@ def apply_rotary(
 
     _, rot_dim = cos_sin_cache.shape
 
-    assert rot_dim in (64, 128)
+    ascend = is_ascend()
+    assert rot_dim in ((64, 128) if ascend else (32, 64, 128, 256))
     assert query.shape[-1] == rot_dim
     assert query.stride(-1) == 1
     assert cos_sin_cache.dtype == torch.float32
     assert cos_sin_cache.stride(1) == 1
-    assert query.dtype in (torch.bfloat16, torch.float32)
+    assert query.dtype in ((torch.bfloat16, torch.float32) if ascend else (torch.float16, torch.bfloat16, torch.float32))
     assert positions is None or positions.dtype in (torch.int32, torch.int64)
     assert positions is None or positions.stride(-1) == 1
     if key is not None:
@@ -80,7 +83,7 @@ def apply_rotary(
     for x, nheads in launch_specs:
         if x.numel() == 0:
             continue
-        if is_ascend():
+        if ascend:
             from tile_kernels.transform.rope_asc import get_rope_kernel_asc
 
             kernel = get_rope_kernel_asc(

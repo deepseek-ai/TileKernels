@@ -19,9 +19,9 @@ def get_rope_kernel_cuda(
     x_stride_1: int,
     use_pdl: bool = False,
 ) -> Any:
-    assert dtype in (T.bfloat16, T.float32)
+    assert dtype in (T.float16, T.bfloat16, T.float32)
     assert positions_dtype in (T.int32, T.int64)
-    assert rotary_dim in (64, 128)
+    assert rotary_dim in (32, 64, 128, 256)
 
     batch = T.dynamic('batch')
     seqlen = T.dynamic('seqlen')
