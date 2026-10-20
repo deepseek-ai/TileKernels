@@ -5,6 +5,7 @@ from tilelang import language as T
 
 from tile_kernels.utils import align, is_power_of_two
 from tile_kernels.quant.common import *
+from tile_kernels.config import get_tilelang_target
 
 
 @T.macro
@@ -26,7 +27,7 @@ def rbits_hash(values, quad_idx):
 
 
 @tilelang.jit(
-    target='cuda',
+    target=get_tilelang_target(),
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: True,
