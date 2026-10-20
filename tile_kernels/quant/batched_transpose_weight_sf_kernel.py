@@ -36,7 +36,10 @@ def batched_transpose_weight_sf(
         return []
 
     device = sf[0].device
-    assert device.type in ('cuda', 'npu')
+    # MUSA reuses the CUDA code path: the kernel body only moves fp32 exponent
+    # bytes through shared memory (no CUDA-only intrinsic), so the device guard
+    # is a backends-with-a-TileLang-target check rather than a CUDA check.
+    assert device.type in ('cuda', 'npu', 'musa')
     pack_factor = get_packed_ue8m0_pack_factor()
     sf_out_dtype = get_packed_ue8m0_torch_dtype()
     num_sf_per_block = 32 if is_ascend() else 16

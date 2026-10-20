@@ -2,9 +2,10 @@ from typing import Any
 
 import tilelang
 import tilelang.language as T
+from tile_kernels.config import get_tilelang_target
 
 
-@tilelang.jit(out_idx=None, target='cuda')
+@tilelang.jit(out_idx=None, target=get_tilelang_target())
 def get_rope_kernel_cuda(
     dtype: T.dtype,
     positions_dtype: T.dtype,

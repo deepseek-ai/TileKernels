@@ -1,9 +1,10 @@
 import tilelang
 from tilelang import language as T
+from tile_kernels.config import get_tilelang_target
 
 
 @tilelang.jit(
-    target='cuda',
+    target=get_tilelang_target(),
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: True,

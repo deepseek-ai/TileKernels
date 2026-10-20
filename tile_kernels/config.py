@@ -30,6 +30,26 @@ def is_ascend() -> bool:
 def get_device() -> str:
     return 'npu' if is_ascend() else 'cuda'
 
+@functools.lru_cache(maxsize=1)
+def get_tilelang_target() -> str:
+    """TileLang compile target for the current accelerator backend.
+
+    MUSA is detected from ``torch.version.musa`` rather than a device node so it
+    also works when torchada maps ``torch.cuda.*`` onto ``torch.musa.*``.
+    """
+    if is_ascend():
+        return 'ascend'
+    import torch
+
+    if getattr(torch.version, 'musa', None) is not None:
+        return 'musa'
+    return 'cuda'
+
+
+def dtype_nbytes(dtype) -> int:
+    """``torch.dtype.bytes`` only exists on torch >= 2.13; fall back to ``itemsize``."""
+    return dtype.bytes if hasattr(dtype, 'bytes') else dtype.itemsize
+
 
 def _validate_quant_fmt(fmt: str) -> None:
     if fmt not in ('e4m3', 'e2m1'):

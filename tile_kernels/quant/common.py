@@ -8,12 +8,13 @@ from tilelang import language as T
 from tile_kernels.config import get_amax_clamp_for_quant, is_ascend
 from tile_kernels.quant.types import QuantTensor
 from tile_kernels.utils import align, ceil_div, str_to_dtype
+from tile_kernels.config import dtype_nbytes
 
 
 @functools.lru_cache(maxsize=8)
 def get_best_vectorize_size(dtype: T.dtype) -> int:
     major, _ = torch.cuda.get_device_capability()
-    return (16 if major < 10 else 32) // dtype.bytes
+    return (16 if major < 10 else 32) // dtype_nbytes(dtype)
 
 
 @dataclass(frozen=True)
@@ -214,7 +215,7 @@ def alloc_scaling_factors(
     sf_shape = get_sf_shape(shape, out_config)
     if out_config.use_tma_aligned_col_major_sf:
         # CUDA: col-major SF must be aligned to 16 bytes for TMA load; Ascend needs no alignment.
-        aligned_sf_shape_1 = align(sf_shape[1], 16 // out_config.sf_dtype.bytes) if not is_ascend() else sf_shape[1]
+        aligned_sf_shape_1 = align(sf_shape[1], 16 // dtype_nbytes(out_config.sf_dtype)) if not is_ascend() else sf_shape[1]
         scaling_factor = torch.empty(
             size=(sf_shape[0], aligned_sf_shape_1),
             dtype=out_config.sf_torch_dtype,

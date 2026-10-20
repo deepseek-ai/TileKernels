@@ -1,7 +1,11 @@
 import math
 
 import tilelang
-from tilelang.cuda import language as T
+# Some TileLang builds (e.g. tilelang-musa) expose only the top-level language module.
+try:
+    from tilelang.cuda import language as T  # type: ignore
+except ImportError:  # pragma: no cover
+    from tilelang import language as T  # type: ignore
 
 from tile_kernels.quant.common import CastOutputConfig, get_sf_and_inv, get_sf_index, get_sf_inv_dtype, get_sf_shape
 from tile_kernels.utils import align, ceil_div
