@@ -37,6 +37,8 @@ def get_engram_gate_bwd_kernel_cuda(
     assert hidden_size % threads == 0
     elems_per_thread = hidden_size // threads
     elems_per_warp_pair = hidden_size // threads_per_head
+    # NOTE: Keep go vec size aligned with x vec size for memory order
+    go_vec_size = 4
     x_vec_size = 4
     v_copy_vec_size = 8
 
@@ -53,16 +55,14 @@ def get_engram_gate_bwd_kernel_cuda(
                 return candidate
         raise ValueError(f'No valid vectorized v copy layout for hidden_size={hidden_size}, vec_size={vec_size}')
 
-    def _choose_go_config(hidden_size, threads_per_head):
-        for vec_size in (8, 4):
-            go_tile = threads_per_head * vec_size
-            go_blk_d = None
-            for blk in range(go_tile, hidden_size // 2 + 1, go_tile):
-                if hidden_size % blk == 0:
-                    go_blk_d = blk
-            if go_blk_d is not None:
-                return vec_size, go_blk_d
-        raise ValueError(f'No valid backward grad_out tile for hidden_size={hidden_size}')
+    def _choose_go_blk_d(hidden_size, go_tile):
+        go_blk_d = None
+        for blk in range(go_tile, hidden_size // 2 + 1, go_tile):
+            if hidden_size % blk == 0:
+                go_blk_d = blk
+        if go_blk_d is None:
+            raise ValueError(f'No valid backward grad_out tile for hidden_size={hidden_size}')
+        return go_blk_d
 
     def _choose_x_blk_d(hidden_size, x_tile, hc_mult, warps_per_head):
         """Largest multiple of x_tile that divides hidden_size, <= hidden_size // 2, fits in smem."""
@@ -78,10 +78,7 @@ def get_engram_gate_bwd_kernel_cuda(
 
     v_vec_size = _choose_v_vec_size(elems_per_thread)
     v_copy_threads = _choose_v_copy_threads(hidden_size, v_copy_vec_size)
-    go_vec_size, go_blk_d = _choose_go_config(
-        hidden_size,
-        threads_per_head,
-    )
+    go_blk_d = _choose_go_blk_d(hidden_size, threads_per_head * go_vec_size)
     x_blk_d = _choose_x_blk_d(hidden_size, threads_per_head * x_vec_size, hc_mult, warps_per_head)
 
     assert hidden_size % x_blk_d == 0

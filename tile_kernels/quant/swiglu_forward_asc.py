@@ -103,9 +103,9 @@ def get_swiglu_forward_kernel_asc(
         zeros = S.vdup(0.0, T.float32)
         if count_clamp:
             if acc is None:
-                acc = S.alloc_local((3,), T.float32)
+                acc = S.alloc_local((3,), T.int32)
                 for i in T.unroll(3, explicit=True):
-                    acc[i] = zeros
+                    acc[i] = S.vdup(0, T.int32)
         if with_certificate:
             certificate_min = S.alloc_var(T.uint32)
             certificate_max = S.alloc_var(T.uint32)
@@ -158,9 +158,9 @@ def get_swiglu_forward_kernel_asc(
                         clamped_mask_0 = S.vcmps(val_l, clamp_value, op='gt')
                         clamped_mask_1 = S.vcmps(val_r, clamp_value, op='gt')
                         clamped_mask_2 = S.vcmps(val_r, -clamp_value, op='lt')
-                        acc[0] = S.vadds(acc[0], 1.0, clamped_mask_0, mode='MODE_MERGING')
-                        acc[1] = S.vadds(acc[1], 1.0, clamped_mask_1, mode='MODE_MERGING')
-                        acc[2] = S.vadds(acc[2], 1.0, clamped_mask_2, mode='MODE_MERGING')
+                        acc[0] = S.vadds(acc[0], 1, clamped_mask_0, mode='MODE_MERGING')
+                        acc[1] = S.vadds(acc[1], 1, clamped_mask_1, mode='MODE_MERGING')
+                        acc[2] = S.vadds(acc[2], 1, clamped_mask_2, mode='MODE_MERGING')
                     if out_config.with_sf:
                         amax_acc[sub] = S.vabs(out_val)
             if out_config.with_sf:
@@ -239,13 +239,13 @@ def get_swiglu_forward_kernel_asc(
         return weight
 
     @T.macro
-    def finish_token(vals, out, amax, inv, sf, out_gm, out_sf_gm, off, tid, acc_buf, count_clamp):
+    def finish_token(vals, out, amax, inv, sf, out_gm, out_sf_gm, off, tid, count_buf, count_clamp):
         if out_config.with_sf:
             quantize_f32(vals, amax, inv, sf, out, off)
         T.copy(out, out_gm[tid, 0])
         store_sf_row(sf, out_sf_gm, off, tid)
         if count_clamp:
-            acc_buf[3] += hidden
+            count_buf[0] += hidden
 
     @T.prim_func
     def swiglu_forward_kernel(
@@ -259,15 +259,14 @@ def get_swiglu_forward_kernel_asc(
     ):
         with T.Kernel(num_vec_cores) as core_id:
             if count_clamp:
-                acc_ub = T.alloc_shared((4,), T.int32)
-                pacc_ub = T.alloc_shared((3, vec_size), T.float32)  # per lane accumulator pacc_ub. use vcadd at the last moment
+                pacc_ub = T.alloc_shared((3, vec_size), T.int32)  # Per-lane counts; reduce in int64 at the end.
+                count_ub = T.alloc_shared((1,), T.int64)
 
-                for i in T.serial(4):
-                    acc_ub[i] = 0
+                count_ub[0] = 0
                 with T.SimdVF():
                     T.clear(pacc_ub)
             else:
-                acc_ub = None
+                count_ub = None
                 pacc_ub = None
 
             if has_psum:
@@ -352,7 +351,7 @@ def get_swiglu_forward_kernel_asc(
                                     S.vsts(certificate_ub[token_offset, 0], S.vcmin(cert_min), dist='ONEPT_B32')
                                     S.vsts(certificate_ub[token_offset, 1], S.vcmax(cert_max), dist='ONEPT_B32')
                             finish_token(
-                                values_ub, out_ub, amax_ub, inverse_ub, sf_dense_ub, out, out_sf, token_offset, token_id, acc_ub, count_clamp
+                                values_ub, out_ub, amax_ub, inverse_ub, sf_dense_ub, out, out_sf, token_offset, token_id, count_ub, count_clamp
                             )
 
                     if use_fast_certificate:  # fall back to exact vdiv for unsafe tokens
@@ -384,12 +383,16 @@ def get_swiglu_forward_kernel_asc(
                         T.copy(sf_ub[:, 0:valid_tokens], output_sf[:, token_base : token_base + valid_tokens])
 
             if count_clamp:
-                with T.SimdVF():
-                    for i in T.unroll(3, explicit=True):
-                        S.vsts(acc_ub[i], S.vcvt(S.vcadd(S.vld(pacc_ub[i, 0])), T.int32), dist='ONEPT_B32')
-
-                with T.SimtVF(threads=1):
-                    for i in T.serial(4):
-                        T.atomic_add(clamped_count[i], T.int64(acc_ub[i]))
+                with T.SimtVF(threads=32):
+                    lane = T.get_thread_binding(0)
+                    for i in T.serial(3):
+                        count = T.alloc_var(T.int64, init=T.int64(pacc_ub[i, lane]) + T.int64(pacc_ub[i, lane + 32]))
+                        # Split at bit 16
+                        count_low = T.warp_reduce_sum(T.int32(count & 0xFFFF))
+                        count_high = T.warp_reduce_sum(T.int32(count >> 16))
+                        if lane == 0:
+                            T.atomic_add(clamped_count[i], (T.int64(count_high) << 16) + T.int64(count_low))
+                    if lane == 0:
+                        T.atomic_add(clamped_count[3], count_ub[0])
 
     return swiglu_forward_kernel

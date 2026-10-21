@@ -60,7 +60,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
 
     assert hidden % vec_size == 0, f'hidden must be divisible by {vec_size}'
     assert hidden % 64 == 0, 'hidden must be divisible by 64'
-    assert num_threads >= 3 * warp_size, '3 warps are used for per group reduction'
+    assert num_threads >= 4 * warp_size, '4 warps are used for per group reduction'
     assert num_warps <= warp_size, 'num warps must not exceed the size of a warp'
 
     # Runtime symbols
@@ -105,7 +105,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
                 iter_start = pid % num_iters
                 iter_rounds = 1
 
-            counts_shared = T.alloc_shared((num_warps * 4,), T.int32)
+            counts_shared = T.alloc_shared((num_warps * 8,), T.int32)
             if num_experts:
                 psum_shared = T.alloc_shared((num_experts,), T.int32)
 
@@ -114,7 +114,9 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
             xl_fp32_local = T.alloc_local((num_thread_vec, vec_size), T.float32)
             xr_fp32_local = T.alloc_local((num_thread_vec, vec_size), T.float32)
             x_local = T.alloc_local((num_thread_vec, vec_size), T.float32)
-            counts_local = T.alloc_local(4, T.int32)
+            counts_local = T.alloc_local(3, T.int32)
+            total_count = T.alloc_var(T.int64, init=0)
+            reduced_counts = T.alloc_local(8, T.int32)
             x_store_local = T.alloc_local((num_thread_vec, vec_size), out_config.dtype)
 
             if num_experts:
@@ -158,7 +160,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
 
                 if count_clamp:
                     if group_offset == 0 and iter_start == 0:
-                        counts_local[3] += hidden
+                        total_count += T.int64(hidden)
 
                 for iter_id in T.serial(iter_rounds):
                     iter = iter_start + iter_id
@@ -300,22 +302,29 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
 
             if count_clamp:
                 T.sync_threads()
-                for i in T.unroll(4):
-                    counts_local[i] = T.warp_reduce_sum(counts_local[i])
+                # Mimic int64 reduction with two int32 reduction
+                for i in T.unroll(3):
+                    reduced_counts[2 * i] = T.warp_reduce_sum(counts_local[i] & 0xFFFF)
+                    reduced_counts[2 * i + 1] = T.warp_reduce_sum(counts_local[i] >> 16)
+                reduced_counts[6] = T.warp_reduce_sum(T.int32(total_count & 0xFFFF))
+                reduced_counts[7] = T.warp_reduce_sum(T.int32(total_count >> 16))
 
                 if lane_id == 0:
-                    for i in T.unroll(4):
-                        counts_shared[num_warps * i + warp_id] = counts_local[i]
+                    for i in T.unroll(8):
+                        counts_shared[num_warps * i + warp_id] = reduced_counts[i]
 
                 T.sync_threads()
                 if warp_id < 4:
-                    reduce_count_var = T.alloc_var(T.int32, init=0)
+                    count_low = T.alloc_var(T.int32, init=0)
+                    count_high = T.alloc_var(T.int32, init=0)
                     if lane_id < num_warps:
-                        reduce_count_var = counts_shared[num_warps * warp_id + lane_id]
-                    reduce_count_var = T.warp_reduce_sum(reduce_count_var)
+                        count_low = counts_shared[num_warps * (2 * warp_id) + lane_id]
+                        count_high = counts_shared[num_warps * (2 * warp_id + 1) + lane_id]
+                    count_low = T.warp_reduce_sum(count_low)
+                    count_high = T.warp_reduce_sum(count_high)
 
                     if lane_id == 0:
-                        T.atomic_add(clamped_count[warp_id], T.int64(reduce_count_var))
+                        T.atomic_add(clamped_count[warp_id], (T.int64(count_high) << 16) + T.int64(count_low))
 
             if use_pdl:
                 T.pdl_trigger()

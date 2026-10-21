@@ -27,7 +27,7 @@ def generate_test_data(params):
     wh_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     we_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     weight_fused = wh_data.float() * we_data.float()
-    image_token_mask = (torch.arange(num_tokens, device=device) % 4 < 2) if params['with_mask'] else None
+    image_token_mask = (torch.arange(num_tokens, device=device) % 5 < 2) if params['with_mask'] else None
     return (x_data, kv_data, wh_data, we_data, weight_fused, eps, clamp_value, image_token_mask)
 
 

@@ -33,6 +33,7 @@ def swiglu_forward_and_per_token_cast_impl(
         assert clamp_value is not None
         assert clamped_count.dim() == 1
         assert clamped_count.shape[0] == 4
+        assert num_expanded_tokens * ceil_div(hidden, 32) <= 0x7FFFFFFF, 'input is too large for int32 clamp counts'
 
     if routed_scaling_factor is not None:
         assert topk_weights is not None, 'routed_scaling_factor requires topk_weights'

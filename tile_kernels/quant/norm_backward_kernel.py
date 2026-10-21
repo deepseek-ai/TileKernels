@@ -72,7 +72,7 @@ def norm_backward(
     if is_ascend():
         from tile_kernels.quant.norm_backward_asc import get_norm_backward_kernel_asc
 
-        kernel = get_norm_backward_kernel_asc(num_tokens=num_tokens, num_vec_cores=num_partials, **kernel_kwargs)
+        kernel = get_norm_backward_kernel_asc(num_vec_cores=num_partials, **kernel_kwargs)
         args = (x, weight, out_grad, rstd, x_grad, weight_grad_partial, residual_out_grad, weight_grad)
     else:
         for tensor in (x, out_grad, residual_out_grad):

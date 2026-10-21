@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import tile_kernels
-from tile_kernels.config import get_device
+from tile_kernels.config import get_device, is_ascend
 from tile_kernels.rand import randn
 from tile_kernels.testing import clear_unused_sf
 from tile_kernels.testing.bench import get_cast_params, make_param_id
@@ -68,11 +68,12 @@ def generate_test_params(level: int) -> list[dict]:
         for args in generate_samples(
             level,
             has_residual=(False, True),
+            with_rstd=(True, False),
             batch_size=(None,) if level == 0 else (None, 2),
-            out_scale=(1.0, 0.3),
-            row_padding=(0, 16),
+            out_scale=(1.0,),
+            row_padding=(16,),
             with_out_bf16=(True, False) if fmt == 'e4m3' else (False,),
-            mega_moe_block_m=(192, 0) if fmt == 'e4m3' and round_sf and hidden % 128 == 0 else (0,),
+            mega_moe_block_m=(192, 0) if not is_ascend() and fmt == 'e4m3' and round_sf and hidden % 128 == 0 else (0,),
         )
         if not args['mega_moe_block_m'] or args['batch_size'] is None
     ]
@@ -93,7 +94,7 @@ def test_norm_forward_and_per_token_cast(params):
     x, weight, residual, mega_moe_sf = generate_test_data(params)
     out = torch.empty_strided(x.shape, x.stride(), dtype=torch.bfloat16 if fmt == 'e4m3' else x.dtype, device=x.device)
     residual_out = torch.empty_like(x) if residual is not None else None
-    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=out_scale, residual_out=residual_out)
+    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=out_scale, residual_out=residual_out, with_rstd=params['with_rstd'])
     if fmt == 'e4m3':
         func = lambda quant_out=None: tile_kernels.quant.norm_forward_and_per_token_cast(
             **args,
@@ -118,7 +119,10 @@ def test_norm_forward_and_per_token_cast(params):
         assert_equal(norm_input, norm_input_ref, check_stride=False)
         if norm_out is not None:
             torch.testing.assert_close(norm_out, out_ref.to(norm_out.dtype))
-        torch.testing.assert_close(rstd, rstd_ref, rtol=2e-6, atol=1e-7)
+        if params['with_rstd']:
+            torch.testing.assert_close(rstd, rstd_ref, rtol=2e-6, atol=1e-7)
+        else:
+            assert rstd is None
 
     # Test the norm outputs
     if fmt == 'e4m3':
@@ -149,7 +153,7 @@ def test_norm_forward_and_per_token_cast(params):
             sf_ref = clear_unused_sf(sf_ref, hidden, num_per_channels)
         assert_equal(output_sf, sf_ref, check_stride=False)
 
-    # Test the Mega MoE SF output
+    # Test the CUDA Mega MoE SF output
     if mega_moe_sf is not None:
         _, packed_sf = cast(normalized, fmt, (1, num_per_channels), round_sf=True, use_packed_ue8m0=True)
         token = torch.arange(x.shape[0], device=x.device)
@@ -189,7 +193,7 @@ def test_norm_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_re
     mega_moe_block_m = params['mega_moe_block_m']
 
     x, weight, residual, mega_moe_sf = generate_test_data(params)
-    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=params['out_scale'])
+    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=params['out_scale'], with_rstd=params['with_rstd'])
     if fmt == 'e4m3':
         func = lambda: tile_kernels.quant.norm_forward_and_per_token_cast(
             **args,

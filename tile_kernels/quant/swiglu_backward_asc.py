@@ -46,6 +46,9 @@ def get_swiglu_backward_kernel_asc(
         block_k -= vec_size
     assert block_k >= 128 and hidden % block_k == 0
 
+    # Padding maps only to unused 32-element amax groups.
+    block_k_aligned = align(block_k, 256)
+
     pack_factor = get_packed_ue8m0_pack_factor() if with_quant and out_config.use_packed_ue8m0 else 1
     num_hidden_blocks = hidden // block_k
     num_groups = hidden // 32 if with_quant else 0
@@ -56,6 +59,8 @@ def get_swiglu_backward_kernel_asc(
     sf_block_stride = align(num_stored_block_groups, vec_size // pack_factor) if with_quant else 0
     sf_half_stride = sf_block_stride * num_hidden_blocks
     sf_row_stride = sf_half_stride * 2
+    if with_quant and out_config.use_tma_aligned_col_major_sf:
+        sf_row_stride += 16 if out_config.use_packed_ue8m0 else 8
     num_scale_vectors = (num_block_groups + vec_size - 1) // vec_size if with_quant else 0
     sf_storage_dtype = T.uint16 if out_config.use_packed_ue8m0 else T.float32
     stored_groups_per_vector = vec_size * pack_factor // block_m
@@ -148,6 +153,17 @@ def get_swiglu_backward_kernel_asc(
         S.vsts(dst[offset + vec_size * 3], value_4_3)
 
     @T.macro
+    def store_tile_amax(src, dst, tile):
+        even01, odd01 = S.vld2(src[tile * 256], dist='DINTLV_B32')
+        even23, odd23 = S.vld2(src[tile * 256 + 128], dist='DINTLV_B32')
+        pair_max01 = S.vmax(S.vabs(even01), S.vabs(odd01))
+        pair_max23 = S.vmax(S.vabs(even23), S.vabs(odd23))
+        even, odd = S.vdintlv(pair_max01, pair_max23)
+        amax = S.vcgmax(S.vmax(even, odd))
+        store_mask = S.pset(32, 'PAT_VL8')
+        S.vsts(dst[tile * 8], amax, store_mask, dist='NORM_B32', extent=8)
+
+    @T.macro
     def init_transpose_indices(indices):
         # Precompute gather indices shared by every token block when converting
         # dense token-major scales to the output layout.
@@ -200,8 +216,8 @@ def get_swiglu_backward_kernel_asc(
             if with_quant:
                 x_sf_ub = T.alloc_shared((sf_block_stride * pack_factor,), T.float32)
                 y_sf_ub = T.alloc_shared((sf_block_stride * pack_factor,), T.float32)
-                x_grad_f32_ub = T.alloc_shared((block_k,), T.float32)
-                y_grad_f32_ub = T.alloc_shared((block_k,), T.float32)
+                x_grad_f32_ub = T.alloc_shared((block_k_aligned,), T.float32)
+                y_grad_f32_ub = T.alloc_shared((block_k_aligned,), T.float32)
                 x_grad_fp8_ub = T.alloc_shared((block_k,), T.float8_e4m3fn)
                 y_grad_fp8_ub = T.alloc_shared((block_k,), T.float8_e4m3fn)
                 # Reused for expanded input scales, amax, and inverse scales.
@@ -326,9 +342,6 @@ def get_swiglu_backward_kernel_asc(
                                 S.mem_bar('VST_VLD')
                             ones = S.vdup(1.0, T.float32)
                             zeros = S.vdup(0.0, T.float32)
-                            if with_quant:
-                                high_half_mask = S.vcmps(S.vci(T.int32(0), T.int32), 31, op='gt')
-                                low_half_mask = S.pset(32, 'PAT_VL32')
                             if with_weight:
                                 weight_acc = S.alloc_var(T.float32)
                                 weight_acc = zeros if hidden_block == 0 else S.vld(weight_acc_ub[row, 0])
@@ -387,12 +400,6 @@ def get_swiglu_backward_kernel_asc(
                                 else:
                                     S.vsts(x_grad_f32_ub[col], x_grad_value)
                                     S.vsts(y_grad_f32_ub[col], y_grad_value)
-                                    x_abs = S.vabs(x_grad_value)
-                                    y_abs = S.vabs(y_grad_value)
-                                    S.vsts(x_quant_scratch_ub[vector * 2], S.vcmax(x_abs, low_half_mask), dist='ONEPT_B32')
-                                    S.vsts(x_quant_scratch_ub[vector * 2 + 1], S.vcmax(x_abs, high_half_mask), dist='ONEPT_B32')
-                                    S.vsts(y_quant_scratch_ub[vector * 2], S.vcmax(y_abs, low_half_mask), dist='ONEPT_B32')
-                                    S.vsts(y_quant_scratch_ub[vector * 2 + 1], S.vcmax(y_abs, high_half_mask), dist='ONEPT_B32')
                                 if do_recompute:
                                     act_out_value = S.vmuls(act_value, effective_weight)
                                     if out_dtype == T.bfloat16:
@@ -410,6 +417,11 @@ def get_swiglu_backward_kernel_asc(
                                     S.vsts(weight_acc_ub[row, 0], weight_acc)
 
                             if with_quant:
+                                S.mem_bar('VST_VLD')
+                                # Batch amax independently to keep the derivative loop compact.
+                                for tile in T.serial(block_k_aligned // 256):
+                                    store_tile_amax(x_grad_f32_ub, x_quant_scratch_ub, tile)
+                                    store_tile_amax(y_grad_f32_ub, y_quant_scratch_ub, tile)
                                 S.mem_bar('VST_VLD')
                                 if num_experts:
                                     valid_token_vec = S.vdup(valid_token_f32, T.float32)

@@ -19,6 +19,7 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
     with_out_bf16: bool = False,
     mega_moe_block_m: int = 0,
     use_pdl: bool = False,
+    with_rstd: bool = False,
 ):
     assert 0 < hidden <= 8192
     assert out_config.with_sf or out_config.dtype == x_dtype
@@ -173,7 +174,7 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
                 T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
             T.finalize_reducer(sum_reducer, sum_fragment)
             rstd_value = T.alloc_var(T.float32, init=T.rsqrt(sum_fragment[row_id, row_offset] / hidden + eps))
-            if row_offset == 0 and token_id < num_tokens:
+            if with_rstd and row_offset == 0 and token_id < num_tokens:
                 rstd[batch_id, token_id] = rstd_value
 
             # Normalize, rounding to the input dtype

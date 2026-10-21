@@ -13,11 +13,6 @@ from tile_kernels.quant.common import (
 from tile_kernels.quant.types import QuantTensor
 
 
-def right_shift_unsigned(x, shift):
-    # CUDA torch does not support bit ops on uint32, so we need to mask to get unsigned right shift
-    return (x >> shift) & ((1 << (32 - shift)) - 1)
-
-
 def get_max_quant_val(dtype: torch.dtype):
     max_quant_by_dtype = {torch.int8: 6.0, torch.float8_e4m3fn: 448.0}
     assert dtype in max_quant_by_dtype
@@ -274,10 +269,10 @@ def cast(
         quant_tensor = torch.clamp(quant_tensor, -max_quant_val, max_quant_val)
         out_weight = quant_tensor.to(out_dtype)
     else:
-        e2m1_value = convert_to_e2m1_bits(quant_tensor, max_quant_val, device)
+        e2m1_value = convert_to_e2m1_bits(quant_tensor)
         # Pack (H, W) -> (H, W/2)
         e2m1_value = e2m1_value.view(h, w // 2, 2)
-        out_weight = e2m1_value[..., 0] | (e2m1_value[..., 1] << 4)
+        out_weight = e2m1_value[..., 0] | (e2m1_value[..., 1] * 16)
         out_weight = out_weight.view(torch.int8)
 
     if sf is not None:
@@ -318,32 +313,13 @@ def cast(
     return out_weight, dq_sf
 
 
-def convert_to_e2m1_bits(quant_tensor, max_quant_val, device):
-    """FP4 cast"""
-    q_int = quant_tensor.contiguous().view(torch.int32)
-    signs = q_int & 0x80000000
-    exponents = (q_int >> 23) & 0xFF
-    mantissas_orig = q_int & 0x7FFFFF
-
-    E8_BIAS, E2_BIAS = 127, 1
-    # Adjust mantissas for subnormals.
-    is_subnormal = exponents < E8_BIAS
-    shift = E8_BIAS - exponents - 1
-    mantissas_pre = 0x400000 | right_shift_unsigned(mantissas_orig, 1)
-    bit0_dropped = (mantissas_orig & 0x1) != 0
-    mask = (1 << shift.clamp(max=31)) - 1
-    dropped_post = (mantissas_pre & mask) != 0
-    sticky = is_subnormal & (bit0_dropped | dropped_post)
-    mantissas = torch.where(is_subnormal, mantissas_pre >> shift, mantissas_orig)
-    exponents = torch.maximum(exponents, torch.tensor(E8_BIAS - E2_BIAS, device=device)) - (E8_BIAS - E2_BIAS)
-    # Round to nearest, ties to even (RTNE)
-    m2bits = right_shift_unsigned(mantissas, 21) & 0x3
-    lsb_keep = right_shift_unsigned(m2bits, 1) & 0x1
-    guard = m2bits & 0x1
-    sticky |= (mantissas & ((1 << 21) - 1)) != 0
-    round_inc = guard & (sticky.to(torch.int32) | lsb_keep)
-    e2m1_tmp = right_shift_unsigned(((exponents << 2) | m2bits) + round_inc, 1)
-    e2m1_tmp = torch.minimum(e2m1_tmp, torch.tensor(0x7, device=device))
-    e2m1_value = (right_shift_unsigned(signs, 28) | e2m1_tmp).to(torch.uint8)  # shape: (..., even_axis_shape)
-
-    return e2m1_value
+def convert_to_e2m1_bits(quant_tensor):
+    """FP4 round-to-nearest-even, with spacing 0.5, 1 and 2 in its three ranges."""
+    # Avoid large integer intermediates and slow AICPU shifts on Ascend.
+    magnitude = torch.nan_to_num(quant_tensor.abs(), nan=6.0, posinf=6.0).clamp(max=6.0)
+    code = torch.where(
+        magnitude < 2,
+        (magnitude * 2).round(),
+        torch.where(magnitude < 4, magnitude.round() + 2, (magnitude * 0.5).round() + 4),
+    ).to(torch.uint8)
+    return code | (torch.signbit(quant_tensor).to(torch.uint8) * 8)

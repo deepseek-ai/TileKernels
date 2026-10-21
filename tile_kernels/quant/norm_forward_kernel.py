@@ -27,16 +27,12 @@ def norm_forward_and_per_token_cast_impl(
     residual_out: Optional[torch.Tensor] = None,
     mega_moe_sf: Optional[torch.Tensor] = None,
     mega_moe_block_m: int = 0,
-) -> tuple[Union[torch.Tensor, QuantTensor], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    with_rstd: bool = False,
+) -> tuple[Union[torch.Tensor, QuantTensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
     assert x.ndim in (2, 3) and x.dtype in (torch.bfloat16, torch.float32) and x.stride(-1) == 1
     num_tokens, hidden = x.shape[-2:]
     batch = x.shape[0] if x.ndim == 3 else 1
     assert hidden > 0
-    if is_ascend():
-        # BF16 padding uses signed 16-bit lane indices in the Ascend kernel.
-        assert x.dtype != torch.bfloat16 or align(hidden, 128) <= 32768, 'Ascend BF16 norm hidden size exceeds 16-bit lane indexing'
-    else:
-        assert hidden % 16 == 0 and hidden <= 8192
 
     def batched(tensor):
         return tensor.unsqueeze(0) if tensor is not None and x.ndim == 2 else tensor
@@ -49,15 +45,6 @@ def norm_forward_and_per_token_cast_impl(
     assert out_config.with_sf or out_config.torch_dtype == x.dtype, 'the unquantized output must match the input dtype'
     assert not out_config.with_sf or hidden % num_per_channels == 0
     assert not with_out_bf16 or out_config.with_sf, 'the extra output is only needed with casting'
-    assert (mega_moe_sf is None) == (mega_moe_block_m == 0)
-    if mega_moe_sf is not None:
-        # INT32 (num_tokens, hidden // 128) view of M-major rows, each row padded per `mega_moe_block_m` tokens
-        assert x.ndim == 2 and mega_moe_block_m > 0
-        assert out_config.with_sf and round_sf and hidden % 128 == 0
-        assert mega_moe_sf.device == x.device
-        assert mega_moe_sf.dtype == torch.int32 and mega_moe_sf.shape == (num_tokens, hidden // 128) and mega_moe_sf.stride(0) == 1
-        num_mega_moe_sf_rows = mega_moe_sf.stride(1)
-        assert ceil_div(num_tokens, mega_moe_block_m) * align(mega_moe_block_m, 128) <= num_mega_moe_sf_rows
 
     # Allocate outputs
     if out is None:
@@ -100,7 +87,7 @@ def norm_forward_and_per_token_cast_impl(
         if tensor is not None:
             assert tensor.shape == x.shape and tensor.dtype == x.dtype and tensor.device == x.device and tensor.stride(-1) == 1
     assert out.shape == x.shape and out.dtype == out_config.torch_dtype and out.device == x.device and out.stride(-1) == 1
-    rstd = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
+    rstd = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device) if with_rstd else None
 
     # Get kernel implement
     kernel_kwargs = dict(
@@ -112,32 +99,48 @@ def norm_forward_and_per_token_cast_impl(
         x_dtype=T.dtype(x.dtype),
         out_config=out_config,
         with_out_bf16=with_out_bf16,
-        mega_moe_block_m=mega_moe_block_m,
+        with_rstd=with_rstd,
     )
+    args = [
+        batched(x),
+        batched(out),
+        batched(out_sf),
+        batched(out_bf16),
+        weight,
+        batched(rstd),
+        batched(residual),
+        batched(residual_out),
+    ]
+    if is_ascend():
+        from tile_kernels.quant.norm_forward_asc import get_norm_forward_kernel_asc
+
+        # BF16 padding uses signed 16-bit lane indices in the Ascend kernel.
+        assert x.dtype != torch.bfloat16 or align(hidden, 128) <= 32768, 'Ascend BF16 norm hidden size exceeds 16-bit lane indexing'
+        if mega_moe_block_m or mega_moe_sf is not None:
+            assert out_config.with_sf and use_packed_ue8m0
+        kernel_factory = get_norm_forward_kernel_asc
+        kernel_kwargs.update(num_vec_cores=get_num_vec_cores())
+    else:
+        assert hidden % 16 == 0 and hidden <= 8192
+        for tensor in (x, out, out_bf16, residual, residual_out):
+            if tensor is not None:
+                assert all(stride % 16 == 0 for stride in tensor.stride()[:-1])
+        assert (mega_moe_sf is None) == (mega_moe_block_m == 0)
+        if mega_moe_block_m:
+            # INT32 (num_tokens, hidden // 128) view of M-major rows, each row padded per `mega_moe_block_m` tokens
+            assert x.ndim == 2 and mega_moe_block_m > 0
+            assert out_config.with_sf and round_sf and hidden % 128 == 0
+            assert mega_moe_sf.device == x.device
+            assert mega_moe_sf.dtype == torch.int32 and mega_moe_sf.shape == (num_tokens, hidden // 128) and mega_moe_sf.stride(0) == 1
+            num_mega_moe_sf_rows = mega_moe_sf.stride(1)
+            assert ceil_div(num_tokens, mega_moe_block_m) * align(mega_moe_block_m, 128) <= num_mega_moe_sf_rows
+        kernel_factory = get_norm_forward_and_per_token_cast_kernel_cuda
+        kernel_kwargs.update(mega_moe_block_m=mega_moe_block_m, use_pdl=get_pdl())
+        args.insert(4, mega_moe_sf)
     if batch * num_tokens > 0:
-        if is_ascend():
-            from tile_kernels.quant.norm_forward_asc import get_norm_forward_kernel_asc
-
-            kernel = get_norm_forward_kernel_asc(num_tokens=num_tokens, num_vec_cores=get_num_vec_cores(), **kernel_kwargs)
-        else:
-            for tensor in (x, out, out_bf16, residual, residual_out):
-                if tensor is not None:
-                    assert all(stride % 16 == 0 for stride in tensor.stride()[:-1])
-            kernel = get_norm_forward_and_per_token_cast_kernel_cuda(**kernel_kwargs, use_pdl=get_pdl())
-        if mega_moe_sf is not None:
-            mega_moe_sf = mega_moe_sf.mT.view(torch.uint8).as_strided((num_mega_moe_sf_rows, hidden // 128, 4), (4, num_mega_moe_sf_rows * 4, 1))
-        args = (
-            batched(x),
-            batched(out),
-            batched(out_sf),
-            batched(out_bf16),
-            mega_moe_sf,
-            weight,
-            batched(rstd),
-            batched(residual),
-            batched(residual_out),
-        )
-
+        if mega_moe_sf is not None and not is_ascend():
+            args[4] = mega_moe_sf.mT.view(torch.uint8).as_strided((num_mega_moe_sf_rows, hidden // 128, 4), (4, num_mega_moe_sf_rows * 4, 1))
+        kernel = kernel_factory(**kernel_kwargs)
         kernel(*args)
 
     norm_input = x if residual is None else residual_out
@@ -172,7 +175,8 @@ def norm_forward_and_per_token_cast(
     residual_out: Optional[torch.Tensor] = None,
     mega_moe_sf: Optional[torch.Tensor] = None,
     mega_moe_block_m: int = 0,
-) -> tuple[QuantTensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    with_rstd: bool = False,
+) -> tuple[QuantTensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
     """RMSNorm with optional input-dtype residual addition, cast to FP8 with per-token (row-wise) scaling factors.
 
     The normalized output is rounded to x.dtype first, so the result equals `per_token_cast` of `norm_forward`.
@@ -192,14 +196,16 @@ def norm_forward_and_per_token_cast(
         out: Optional pre-allocated QuantTensor (data, sf); the sf buffer must be row-major.
         out_bf16: Optional BF16 buffer for the normalized output, requires `with_out_bf16`.
         residual_out: Optional buffer for x + residual; ignored without residual.
-        mega_moe_sf: Optional INT32 (num_tokens, hidden // 128) M-major view of the mega MoE shared activation sf buffer,
+        mega_moe_sf: CUDA-only optional INT32 (num_tokens, hidden // 128) M-major view of the mega MoE shared activation sf buffer,
             receiving the packed UE8M0 sf of 32 channels as well: tokens are split into `mega_moe_block_m` chunks, each padded
             to a multiple of 128 rows, and the rows of every 128 are transposed as 4 x 32. Rows of padding are untouched.
+            Ascend uses packed UE8M0 out_sf instead.
         mega_moe_block_m: Token block size of the mega MoE kernel, required with `mega_moe_sf`.
+        with_rstd: Whether to output FP32 rstd. Defaults to False.
 
     Returns:
         A tuple ``((out, out_sf), out_bf16, rstd, norm_input)``: the quantized output and sf factors, the normalized
-        BF16 output (None without `with_out_bf16`), FP32 rstd of shape x.shape[:-1], and the residual sum in x.dtype
+        BF16 output (None without `with_out_bf16`), optional FP32 rstd of shape x.shape[:-1], and the residual sum in x.dtype
         (aliasing x without residual).
     """
     out, out_sf = (None, None) if out is None else out
@@ -221,6 +227,7 @@ def norm_forward_and_per_token_cast(
         residual_out=residual_out,
         mega_moe_sf=mega_moe_sf,
         mega_moe_block_m=mega_moe_block_m,
+        with_rstd=with_rstd,
     )
 
 
@@ -232,7 +239,8 @@ def norm_forward(
     out_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with_rstd: bool = False,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """RMSNorm with optional input-dtype residual addition.
 
     Args:
@@ -243,6 +251,7 @@ def norm_forward(
         out_scale: FP32 multiplier applied to weight before the output product.
         out: Optional output buffer matching x, with non-overlapping rows.
         residual_out: Optional buffer for x + residual; ignored without residual.
+        with_rstd: Whether to output FP32 rstd. Defaults to False.
 
     Supports positive hidden sizes and empty batches. CUDA requires hidden divisible by 16,
     limits hidden to 8192, and requires row/batch strides divisible by 16.
@@ -251,7 +260,7 @@ def norm_forward(
     Output buffers must not overlap inputs or each other.
 
     Returns:
-        Output, FP32 rstd of shape x.shape[:-1], and the residual sum in x.dtype.
+        Output, FP32 rstd of shape x.shape[:-1] (None when with_rstd=False), and the residual sum in x.dtype.
         Without residual the third return value aliases x.
     """
     assert x.dtype in (torch.bfloat16, torch.float32)
@@ -265,5 +274,6 @@ def norm_forward(
         out_scale,
         out=out,
         residual_out=residual_out,
+        with_rstd=with_rstd,
     )
     return out, rstd, norm_input

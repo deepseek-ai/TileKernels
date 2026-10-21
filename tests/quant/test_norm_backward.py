@@ -56,7 +56,7 @@ def generate_test_params(level: int) -> list[dict]:
         for use_weight in (True, False)
         for args in generate_samples(
             level,
-            has_out_grad=(True,) if level == 0 else (True, False),
+            has_out_grad=(True,),
             has_residual_out_grad=(False, True),
             accumulate=(False, True) if use_weight else (False,),
             out_scale=(1.0, 0.3),

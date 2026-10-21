@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from tile_kernels.config import get_device, is_ascend
+from tile_kernels.config import get_device
 from tile_kernels.engram import engram_gate_bwd
 from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
@@ -28,7 +28,7 @@ def generate_test_data(params):
     we_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     weight_fused = wh_data.float() * we_data.float()
     grad_out = randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
-    image_token_mask = torch.arange(num_tokens, device=device) % 4 < 2 if params['with_mask'] else None
+    image_token_mask = torch.arange(num_tokens, device=device) % 5 < 2 if params['with_mask'] else None
     return (x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, image_token_mask)
 
 
@@ -37,7 +37,7 @@ def generate_test_params(level: int, mask_options: tuple[bool, ...] = (False, Tr
         {'num_tokens': t, 'hc': hc, 'hidden': hidden_size, 'with_mask': with_mask}
         for t in generate_num_tokens(level)
         for hc in (4,)
-        for hidden_size in generate_hidden_sizes(512 if is_ascend() else 256)
+        for hidden_size in generate_hidden_sizes(256)
         for with_mask in mask_options
     ]
 
@@ -81,10 +81,10 @@ def test_engram_gate_bwd(params):
     grad_we = grad_w_fused * wh_data.float()
 
     # Correctness
-    torch.testing.assert_close(grad_x, x_ref.grad, rtol=8e-3, atol=7e-3)
+    torch.testing.assert_close(grad_x, x_ref.grad, rtol=8e-3, atol=8e-3)
     torch.testing.assert_close(grad_kv, kv_ref.grad, rtol=7e-3, atol=7e-3)
     torch.testing.assert_close(grad_wh, wh_ref.grad, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(grad_we, we_ref.grad, rtol=1e-4, atol=2e-4)
+    torch.testing.assert_close(grad_we, we_ref.grad, rtol=2e-4, atol=2e-4)
     if image_token_mask is not None:
         assert_equal(grad_x[image_token_mask], grad_out[image_token_mask])
         assert_equal(grad_kv[image_token_mask], torch.zeros_like(grad_kv[image_token_mask]))

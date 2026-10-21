@@ -20,7 +20,7 @@ def get_engram_gate_bwd_kernel_asc(
 
     assert hc_mult == 4
     assert num_vec_cores % hc_mult == 0
-    assert hidden_size % (hc_mult * bf16_vec_size) == 0
+    assert hidden_size % (hc_mult * vec_size) == 0
 
     num_chunks = hidden_size // vec_size
     num_chunk_groups = num_chunks // num_accs
@@ -86,6 +86,8 @@ def get_engram_gate_bwd_kernel_asc(
                             S.vsts(x[chunk * bf16_vec_size], zero_bf16, dist='NORM_B16')
                         for chunk in range(v_slice_bf16_chunks):
                             S.vsts(v[v_slice_begin + chunk * bf16_vec_size], zero_bf16, dist='NORM_B16')
+                        if v_slice_size % bf16_vec_size != 0:
+                            S.vsts(v[v_slice_begin + v_slice_bf16_chunks * bf16_vec_size], zero_bf16, dist='PK_B32')
                 else:
                     with T.Task():
                         for head_delta in T.unroll(1, hc_mult, explicit=True):
