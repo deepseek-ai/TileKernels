@@ -1,5 +1,10 @@
 import tilelang
+import torch
 from tilelang import language as T
+
+# HIP has no named barriers, and a wavefront is 64 threads: the 96-thread split
+# below (32 + 64) cannot fence shared memory inside its second branch.
+_IS_HIP = torch.version.hip is not None
 
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -104,6 +109,25 @@ def mhc_pre_big_fuse_fwd_cuda(
             # save comb_mix to global memory
             for j, k in T.Parallel(mhc_mult, mhc_mult):
                 comb_mix[pid, j * mhc_mult + k] = cm[j, k]
+        elif _IS_HIP:
+            ##################################################################
+            # _mhc_pre_split_mixes_fwd (pre) + _mhc_pre_apply_mix_fwd, register only:
+            # every thread recomputes the pre mix and loads its own residual slice.
+            pre_local = T.alloc_local(mhc_mult, T.float32)
+            for j in T.serial(mhc_mult):
+                pre_local[j] = T.sigmoid(mixes_shared[j] * mhc_scale[0] + mhc_base[j]) + mhc_pre_eps
+            for i0_h in T.serial(hidden_size // hidden_block):
+                xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
+                T.copy(residual[pid, 0, i0_h * hidden_block], xl, disable_tma=True)
+
+                ol = T.alloc_fragment(hidden_block, T.float32)
+                T.clear(ol)
+
+                for i_mhc in T.serial(mhc_mult):
+                    for i1_h in T.Parallel(hidden_block):
+                        ol[i1_h] += pre_local[i_mhc] * xl[i_mhc, i1_h]
+
+                T.copy(ol, layer_input[pid, i0_h * hidden_block], disable_tma=True)
         else:
             ##################################################################
             # _mhc_pre_split_mixes_fwd (pre)

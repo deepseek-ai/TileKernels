@@ -202,7 +202,12 @@ def test_correctness(
 
     assert torch.equal(post_mix_fused, post_mix_ref)
     assert torch.equal(comb_mix_fused, comb_mix_ref)
-    assert torch.equal(layer_input_fused, layer_input_ref)
+    if torch.version.hip is None:
+        assert torch.equal(layer_input_fused, layer_input_ref)
+    else:
+        # HIP computes the apply-mix in registers (see pre_big_fuse_cuda.py) with another thread
+        # layout than mhc_pre_apply_mix_fwd, so a few outputs round one bf16 ulp apart.
+        torch.testing.assert_close(layer_input_fused, layer_input_ref, rtol=2**-7, atol=2**-7)
 
 
 _PRE_BIG_FUSE_BENCH_CASES = [

@@ -73,11 +73,13 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
         atol=1e-4,
         rtol=1e-4,
     )
+    # The hidden-dim reduction behind this gradient is ordered differently on HIP.
+    comb_tol = 2e-4 if torch.version.hip is not None else 1e-4
     torch.testing.assert_close(
         grad_comb_res_mix_tl,
         comb_res_mix_ref.grad,
-        atol=1e-4,
-        rtol=1e-4,
+        atol=comb_tol,
+        rtol=comb_tol,
     )
 
 
