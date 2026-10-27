@@ -16,7 +16,7 @@ import threading
 import pytest
 import torch
 
-from tile_kernels.testing.pytest.common import item_source_file, merge_mode, validate_merge_mode
+from tile_kernels.testing.pytest.common import get_tests_dir, item_source_file, merge_mode, validate_merge_mode
 
 
 _GPU_MEM_TMP_ENV = '_TK_GPU_MEM_OUTPUT'
@@ -25,7 +25,12 @@ _gpu_mem_profile_update_lock = threading.Lock()
 
 def _gpu_mem_profiles_dir(config):
     d = os.environ.get('TK_GPU_MEM_PROFILES_DIR', '')
-    return d or None
+    if d:
+        return d
+    tests_dir = get_tests_dir()
+    if tests_dir:
+        return os.path.join(tests_dir, 'gpu_mem_profiles')
+    return None
 
 
 def pytest_addoption(parser):
