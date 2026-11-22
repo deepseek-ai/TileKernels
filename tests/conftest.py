@@ -10,6 +10,7 @@
 # triggers CUDA driver initialization, e.g. tilelang).
 # ---------------------------------------------------------------------------
 import os
+import re
 import signal
 import subprocess
 import math
@@ -79,9 +80,10 @@ def _bind_worker_gpu():
                     timeout=10,
                 )
                 if result.returncode == 0:
-                    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-                    # Except the header line
-                    npu_list = [str(i) for i in range(len(lines) - 1)]
+                    # `npu-smi info -l` prints a "Total Count : N" header followed by a
+                    # multi-line record per NPU, so count the header, not the lines.
+                    match = re.search(r'Total\s+Count\s*:\s*(\d+)', result.stdout)
+                    npu_list = [str(i) for i in range(int(match.group(1)))] if match else ['0']
                 else:
                     npu_list = ['0']
             except (FileNotFoundError, subprocess.TimeoutExpired):
