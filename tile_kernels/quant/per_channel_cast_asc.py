@@ -7,7 +7,6 @@ from tile_kernels.quant.common import *
 # Re-bind below the star import: tile_kernels.quant.common exports its own `T`.
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
-from tile_kernels.quant.common import get_packed_ue8m0_pack_factor
 
 
 @tilelang.jit
@@ -23,19 +22,19 @@ def get_per_channel_cast_kernel_asc(
         num_per_channels = in_config.sf_block[1]
         assert num_per_channels == 32, 'Ascend rescale supports num_per_channels == 32 only'
     else:
-        assert in_config.dtype == T.bfloat16, 'per_channel_cast supports bf16 or e4m3 (rescale) input only'
+        assert in_config.dtype in (T.bfloat16, T.float32), 'per_channel_cast supports bf16, fp32 or e4m3 (rescale) input only'
 
     quant_max = 448.0
     assert out_config.clamp_min_value >= quant_max * (2 ** (-126)), 'Ascend scale exponent fast path requires clamp to normal number'
 
-    use_bf16_compute = not in_config.with_sf or in_config.use_packed_ue8m0
+    use_bf16_compute = in_config.dtype == T.bfloat16 or (in_config.with_sf and in_config.use_packed_ue8m0)
     # Packed input with rounded output decode at 1024x256, the other bf16 paths pick 256x128.
     use_large_block = in_config.with_sf and in_config.use_packed_ue8m0 and out_config.round_sf
     vector_width = 256  # SIMD vector width in bytes
     vector_alignment = 32  # Minimum byte alignment for vector loads
     max_block_k = 1024 if use_large_block else 256
     block_k = math.gcd(max_block_k, hidden)
-    block_m = min(128, 32768 // block_k)
+    block_m = min(128, (16384 if in_config.dtype == T.float32 else 32768) // block_k)
     sf_rows_per_group = block_m // num_per_tokens
 
     assert block_m % num_per_tokens == 0, (
@@ -63,7 +62,7 @@ def get_per_channel_cast_kernel_asc(
         x_sf_shape = (x_sf_shape[0], x_sf_shape[1] // pack_factor)
     in_sf_stride = T.dynamic('in_sf_stride') if in_config.with_sf else x_sf_shape[1]
     sf_in_dtype = T.int16 if packed_col_major_sf else in_config.sf_dtype
-    quant_chunk_size = 128 if use_bf16_compute and not use_large_block else min(256, block_k)
+    quant_chunk_size = 128 if use_bf16_compute and (not use_large_block or block_k == 512) else min(256, block_k)
     # Count 64-lane fp32 vectors; each pair combines into one 128-lane bf16 vector.
     num_vecs = quant_chunk_size // 64
     compute_vec_factor = 2 if use_bf16_compute else 1
@@ -80,23 +79,6 @@ def get_per_channel_cast_kernel_asc(
             sf_in_rows = block_m + T.ceildiv(sf_load_elements, sf_in_cols) - 1
             sf_in_ub_shape = (sf_in_rows, sf_in_cols)
         dequant_ub_dtype = T.bfloat16 if use_bf16_compute else T.float32
-
-    @T.macro
-    def compute_sf_and_inv(amax):
-        clamped_amax = S.vmax(amax, S.vdup(out_config.clamp_min_value, T.float32))
-        if not out_config.round_sf:
-            sf = S.vdiv(clamped_amax, S.vdup(quant_max, T.float32))
-            sf_inv = S.vdiv(S.vdup(quant_max, T.float32), clamped_amax)
-            return sf, sf_inv
-        raw_sf = S.vmul(clamped_amax, S.vdup(1.0 / quant_max, T.float32))
-        raw_sf_bits = T.reinterpret(raw_sf, 'uint32x64')
-        sf_exponent = S.vadds(S.vshrs(S.vsub(raw_sf_bits, S.vdup(1, T.uint32)), 23), 1)
-        sf_inv_exponent = S.vsub(S.vdup(254, T.uint32), sf_exponent)
-        sf_inv = T.reinterpret(S.vshls(sf_inv_exponent, 23), 'float32x64')
-        if out_config.use_packed_ue8m0:
-            return sf_exponent, sf_inv
-        sf = T.reinterpret(S.vshls(sf_exponent, 23), 'float32x64')
-        return sf, sf_inv
 
     @T.macro
     def quantize_block(x_ub, out_ub, sf_out_ub, sf_in_ub, dequant_ub, sf_row_base=0):
@@ -129,7 +111,8 @@ def get_per_channel_cast_kernel_asc(
                         sf_row_stride = sf_in_cols
             else:
                 f32_abs_mask = T.reinterpret(S.vdup(0x7FFFFFFF, T.uint32), 'float32x64')
-                sf_lane = T.reinterpret(S.vshrs(S.vci(0, T.int32), 5), 'uint32x64')  # 0x32 1x32
+                if in_config.with_sf:
+                    sf_lane = T.reinterpret(S.vshrs(S.vci(0, T.int32), 5), 'uint32x64')  # 0x32 1x32
 
             for sf_row in T.serial(sf_rows_per_group):
                 row_base = sf_row * num_per_tokens
@@ -167,22 +150,26 @@ def get_per_channel_cast_kernel_asc(
                         else:
                             # f32 path
                             amax[vec] = S.vdup(0.0, T.float32)
-                            if in_config.use_tma_aligned_col_major_sf:
-                                sf_offsets = S.vadds(S.vmuls(sf_lane, block_m), (chunk * 8 + vec * 2) * block_m)
-                            else:
-                                sf_offsets = S.vadds(sf_lane, vec * 2)
-                            for row in T.serial(num_per_tokens):
+                            if in_config.with_sf:
                                 if in_config.use_tma_aligned_col_major_sf:
-                                    input_scale = S.vgather2(sf_in_ub[0, 0], S.vadds(sf_offsets, row_base + row))
+                                    sf_offsets = S.vadds(S.vmuls(sf_lane, block_m), (chunk * 8 + vec * 2) * block_m)
                                 else:
-                                    compact_sf = S.vld(sf_in_ub[row_base + row, chunk * 8])
-                                    input_scale = S.vselr(compact_sf, sf_offsets)
-                                dequant_f32 = S.vmul(
-                                    S.vcvt(S.vld(x_ub[row_base + row, chunk_base + vec_col], dist='UNPK4_B8'), T.float32),
-                                    input_scale,
-                                )
-                                S.vsts(dequant_ub[row, vec_col], dequant_f32)
-                                amax[vec] = S.vmax(amax[vec], S.vand(dequant_f32, f32_abs_mask))
+                                    sf_offsets = S.vadds(sf_lane, vec * 2)
+                            for row in T.serial(num_per_tokens):
+                                if in_config.with_sf:
+                                    if in_config.use_tma_aligned_col_major_sf:
+                                        input_scale = S.vgather2(sf_in_ub[0, 0], S.vadds(sf_offsets, row_base + row))
+                                    else:
+                                        compact_sf = S.vld(sf_in_ub[row_base + row, chunk * 8])
+                                        input_scale = S.vselr(compact_sf, sf_offsets)
+                                    values_fp32 = S.vmul(
+                                        S.vcvt(S.vld(x_ub[row_base + row, chunk_base + vec_col], dist='UNPK4_B8'), T.float32),
+                                        input_scale,
+                                    )
+                                    S.vsts(dequant_ub[row, vec_col], values_fp32)
+                                else:
+                                    values_fp32 = S.vld(x_ub[row_base + row, chunk_base + vec_col])
+                                amax[vec] = S.vmax(amax[vec], S.vand(values_fp32, f32_abs_mask))
                         if use_bf16_compute:
                             # Merge the 128-lane bf16 amax into two f32 half-vectors
                             amax_lo, amax_hi = S.vintlv(zero_bf16, amax_bf16[vec])
@@ -195,7 +182,7 @@ def get_per_channel_cast_kernel_asc(
                         # Write sf_out_ub
                         for half in T.unroll(2, explicit=True):
                             vec = pair * 2 + half
-                            sf, sf_inv[vec] = compute_sf_and_inv(amax[vec])
+                            sf, sf_inv[vec] = get_sf_and_inv_asc(amax[vec], out_config)
                             S.vsts(sf_out_ub[sf_row_base + sf_row, chunk_base + vec * 64], sf, dist=sf_dist)
 
                         # Calculate and write out_ub
@@ -205,10 +192,12 @@ def get_per_channel_cast_kernel_asc(
                             for row in T.serial(num_per_tokens):
                                 if use_bf16_compute:
                                     value_ub, value_row, value_col = (dequant_ub, row, 0) if in_config.with_sf else (x_ub, row_base + row, chunk_base)
-                                    dequant_f32 = S.vcvt(S.vld(value_ub[value_row, value_col + vec_col], dist='UNPK_B16'), T.float32)
+                                    values_fp32 = S.vcvt(S.vld(value_ub[value_row, value_col + vec_col], dist='UNPK_B16'), T.float32)
+                                elif in_config.with_sf:
+                                    values_fp32 = S.vld(dequant_ub[row, vec_col])
                                 else:
-                                    dequant_f32 = S.vld(dequant_ub[row, vec_col])
-                                scaled = S.vmul(dequant_f32, sf_inv[vec])
+                                    values_fp32 = S.vld(x_ub[row_base + row, chunk_base + vec_col])
+                                scaled = S.vmul(values_fp32, sf_inv[vec])
                                 S.vsts(
                                     out_ub[row_base + row, chunk_base + vec_col],
                                     S.vcvt(scaled, T.float8_e4m3fn),

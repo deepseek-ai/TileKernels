@@ -1,7 +1,6 @@
 import os
 
 import pytest
-import torch
 
 from tile_kernels.config import get_device
 from tile_kernels.engram import fused_weight
@@ -9,6 +8,7 @@ from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
 from tile_kernels.testing.generator import generate_hidden_sizes, get_test_level
 from tile_kernels.testing.numeric import assert_equal, count_bytes
+from tile_kernels.utils import str_to_dtype
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -17,17 +17,23 @@ os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
 def generate_test_data(params):
     hc_mult = params['hc']
     hidden_size = params['hidden']
+    dtype = str_to_dtype(params['dtype'])
     device = get_device()
-    wh_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
-    we_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    wh_data = randn(hc_mult, hidden_size, dtype=dtype, device=device)
+    we_data = randn(hc_mult, hidden_size, dtype=dtype, device=device)
     return (wh_data, we_data)
 
 
 def generate_test_params(level: int) -> list[dict]:
-    return [{'hc': hc, 'hidden': hidden_size} for hc in (4,) for hidden_size in generate_hidden_sizes(256)]
+    return [
+        {'hc': hc, 'hidden': hidden_size, 'dtype': dtype}
+        for hc in (4,)
+        for hidden_size in generate_hidden_sizes(level, ['main'], align=128)
+        for dtype in ['bf16', 'fp32']
+    ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_fused_weight(params):
     wh_data, we_data = generate_test_data(params)
 
@@ -38,7 +44,7 @@ def test_engram_fused_weight(params):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(1), ids=make_param_id)
 def test_engram_fused_weight_benchmark(benchmark_timer, benchmark_record, params):
     wh_data, we_data = generate_test_data(params)
     out = fused_weight(wh_data, we_data)

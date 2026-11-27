@@ -1,6 +1,8 @@
 import tilelang
 from tilelang.ascend import language as T
 
+from tile_kernels.config import get_max_ub_per_vector_core
+
 _COMPACT_REDUCE_TOKEN_BLOCK = 16
 _COMPACT_REDUCE_SPLIT_CHUNK = 32
 _COMPACT_REDUCE_MHC_MULT3 = 24
@@ -147,9 +149,12 @@ def mhc_fn_normw_merge_bwd_asc(
             T.copy(normw_grad_ub, normw_grad[hidden_offset : hidden_offset + hidden_block])
 
 
-def _compact_reduce_split_chunk(n_splits: int) -> int:
+def _compact_reduce_split_chunk(n_splits: int, token_block: int, num_stages: int) -> int:
+    fixed_ub = (3 * token_block * _COMPACT_REDUCE_MHC_MULT3 + 2 * 64) * 4
+    bytes_per_split = (token_block * _COMPACT_REDUCE_MHC_MULT3 + 64) * 4 * num_stages
+    max_chunk = (get_max_ub_per_vector_core(use_simt=False) - fixed_ub) // bytes_per_split
     for split_chunk in (_COMPACT_REDUCE_SPLIT_CHUNK, 16, 8, 4, 2):
-        if n_splits % split_chunk == 0:
+        if split_chunk <= max_chunk and n_splits % split_chunk == 0:
             return split_chunk
     return 1
 
@@ -165,6 +170,7 @@ def mhc_reduce_partials_and_rmsnorm_fwd_asc(
     rms_eps: float,
     n_splits: int,
     num_vec_cores: int,
+    token_block: int = _COMPACT_REDUCE_TOKEN_BLOCK,
 ):
     from tilelang.ascend.language import simd as S
 
@@ -180,11 +186,14 @@ def mhc_reduce_partials_and_rmsnorm_fwd_asc(
     sqrsum: T.Tensor[(num_tokens, n_rms_group), T.float32]
     out: T.Tensor[(num_tokens, mhc_mult3), T.float32]
 
-    token_block = _COMPACT_REDUCE_TOKEN_BLOCK
-    split_chunk = _compact_reduce_split_chunk(n_splits)
-    compact_vregs = _COMPACT_REDUCE_VREGS
+    assert 1 <= token_block <= 64 and token_block * mhc_mult3 % 64 == 0, (
+        f'token_block must be in 1..64 with token_block * mhc_mult3 divisible by 64, got {token_block}'
+    )
+    compact_vregs = token_block * mhc_mult3 // 64
+    token_mask = 'PAT_ALL' if token_block == 64 else f'PAT_VL{token_block}'
     sq_pad64 = 64
     num_stages = 3
+    split_chunk = _compact_reduce_split_chunk(n_splits, token_block, num_stages)
     n_token_blocks = T.ceildiv(num_tokens, token_block)
     n_split_chunks = n_splits // split_chunk
     assert n_splits % split_chunk == 0, 'compact reduce requires n_splits divisible by selected split_chunk'
@@ -236,7 +245,7 @@ def mhc_reduce_partials_and_rmsnorm_fwd_asc(
 
                 with T.SimdVF():
                     mask_full = S.pset(32)
-                    mask_token = S.pset(32, 'PAT_VL16')
+                    mask_token = S.pset(32, token_mask)
                     acc = S.alloc_local((compact_vregs,), T.float32)
                     acc_sq = S.alloc_var(T.float32)
                     for vec_idx in T.unroll(compact_vregs, explicit=True):
@@ -347,82 +356,58 @@ def mhc_reduce_partials_and_rmsnorm_bwd_asc(
 
         for block_id in T.Persistent([n_token_blocks], num_vec_cores, core_id, group_size=1, num_stages=num_stages):
             token_base = block_id * token_block
-            if token_base + token_block <= num_tokens:
-                T.copy(out_grad[token_base : token_base + token_block, :mhc_mult3], out_grad_ub[:, :mhc_mult3])
-                T.copy(out_mul[token_base : token_base + token_block, 0, :mhc_mult3], out_mul_ub[:, :mhc_mult3])
-                T.copy(sqrsum[token_base : token_base + token_block, 0], sqrsum_ub[:token_block])
+            T.copy(out_grad[token_base : token_base + token_block, :mhc_mult3], out_grad_ub[:, :mhc_mult3])
+            T.copy(out_mul[token_base : token_base + token_block, 0, :mhc_mult3], out_mul_ub[:, :mhc_mult3])
+            T.copy(sqrsum[token_base : token_base + token_block, 0], sqrsum_ub[:token_block])
 
-                with T.SimdVF():
-                    mask_full = S.pset(32)
-                    mask_lane0 = S.pset(32, 'PAT_VL1')
-                    mask_first_token = S.pset(32, 'PAT_VL32')
-                    lane_idx = S.vci(T.int32(0), T.int32)
-                    first_token_mask = S.vcmps(lane_idx, T.int32(mhc_mult3), mask_full, 'lt')
-                    second_token_mask = S.pand(
-                        S.vcmps(lane_idx, T.int32(32), mask_full, 'ge'),
-                        S.vcmps(lane_idx, T.int32(32 + mhc_mult3), mask_full, 'lt'),
-                        mask_full,
+            with T.SimdVF():
+                mask_full = S.pset(32)
+                mask_lane0 = S.pset(32, 'PAT_VL1')
+                mask_first_token = S.pset(32, 'PAT_VL32')
+                lane_idx = S.vci(T.int32(0), T.int32)
+                first_token_mask = S.vcmps(lane_idx, T.int32(mhc_mult3), mask_full, 'lt')
+                second_token_mask = S.pand(
+                    S.vcmps(lane_idx, T.int32(32), mask_full, 'ge'),
+                    S.vcmps(lane_idx, T.int32(32 + mhc_mult3), mask_full, 'lt'),
+                    mask_full,
+                )
+                inv_rms_group_size = S.vdup(T.float32(1.0 / rms_group_size), T.float32, mask_full)
+                one = S.vdup(T.float32(1.0), T.float32, mask_full)
+                neg_half = S.vdup(T.float32(-0.5), T.float32, mask_full)
+
+                for pair_idx in T.unroll(token_block // 2, explicit=True):
+                    grad_pair = S.vld(out_grad_ub[pair_idx * 2, 0])
+                    mul_pair = S.vld(out_mul_ub[pair_idx * 2, 0])
+                    sq_even = S.vld(sqrsum_ub[pair_idx * 2], dist='BRC_B32')
+                    sq_odd = S.vld(sqrsum_ub[pair_idx * 2 + 1], dist='BRC_B32')
+                    rms_even = S.vdiv(
+                        one, S.vsqrt(S.vadds(S.vmul(sq_even, inv_rms_group_size, mask_full), T.float32(rms_eps), mask_full), mask_full), mask_full
                     )
-                    inv_rms_group_size = S.vdup(T.float32(1.0 / rms_group_size), T.float32, mask_full)
-                    one = S.vdup(T.float32(1.0), T.float32, mask_full)
-                    neg_half = S.vdup(T.float32(-0.5), T.float32, mask_full)
+                    rms_odd = S.vdiv(
+                        one, S.vsqrt(S.vadds(S.vmul(sq_odd, inv_rms_group_size, mask_full), T.float32(rms_eps), mask_full), mask_full), mask_full
+                    )
+                    rms_pair = S.vsel(rms_even, rms_odd, mask_first_token)
+                    grad_mul = S.vmul(grad_pair, mul_pair, mask_full)
+                    out_mul_grad_pair = S.vmul(grad_pair, rms_pair, mask_full)
+                    S.vsts(out_mul_grad_ub[pair_idx * 2, 0], out_mul_grad_pair, mask_full, 'NORM_B32')
 
-                    for pair_idx in T.unroll(token_block // 2, explicit=True):
-                        grad_pair = S.vld(out_grad_ub[pair_idx * 2, 0])
-                        mul_pair = S.vld(out_mul_ub[pair_idx * 2, 0])
-                        sq_even = S.vld(sqrsum_ub[pair_idx * 2], dist='BRC_B32')
-                        sq_odd = S.vld(sqrsum_ub[pair_idx * 2 + 1], dist='BRC_B32')
-                        rms_even = S.vdiv(
-                            one, S.vsqrt(S.vadds(S.vmul(sq_even, inv_rms_group_size, mask_full), T.float32(rms_eps), mask_full), mask_full), mask_full
-                        )
-                        rms_odd = S.vdiv(
-                            one, S.vsqrt(S.vadds(S.vmul(sq_odd, inv_rms_group_size, mask_full), T.float32(rms_eps), mask_full), mask_full), mask_full
-                        )
-                        rms_pair = S.vsel(rms_even, rms_odd, mask_first_token)
-                        grad_mul = S.vmul(grad_pair, mul_pair, mask_full)
-                        out_mul_grad_pair = S.vmul(grad_pair, rms_pair, mask_full)
-                        S.vsts(out_mul_grad_ub[pair_idx * 2, 0], out_mul_grad_pair, mask_full, 'NORM_B32')
+                    rms_grad_even = S.vcadd(grad_mul, first_token_mask)
+                    rms_grad_odd = S.vcadd(grad_mul, second_token_mask)
+                    denom_even = S.vadds(sq_even, T.float32(rms_eps * rms_group_size), mask_full)
+                    denom_odd = S.vadds(sq_odd, T.float32(rms_eps * rms_group_size), mask_full)
+                    sq_grad_even = S.vmul(S.vdiv(S.vmul(rms_grad_even, rms_even, mask_full), denom_even, mask_full), neg_half, mask_full)
+                    sq_grad_odd = S.vmul(S.vdiv(S.vmul(rms_grad_odd, rms_odd, mask_full), denom_odd, mask_full), neg_half, mask_full)
+                    S.vsts(sqrsum_grad_ub[pair_idx * 2, 0], sq_grad_even, mask_lane0, 'ONEPT_B32')
+                    S.vsts(sqrsum_grad_ub[pair_idx * 2 + 1, 0], sq_grad_odd, mask_lane0, 'ONEPT_B32')
 
-                        rms_grad_even = S.vcadd(grad_mul, first_token_mask)
-                        rms_grad_odd = S.vcadd(grad_mul, second_token_mask)
-                        denom_even = S.vadds(sq_even, T.float32(rms_eps * rms_group_size), mask_full)
-                        denom_odd = S.vadds(sq_odd, T.float32(rms_eps * rms_group_size), mask_full)
-                        sq_grad_even = S.vmul(S.vdiv(S.vmul(rms_grad_even, rms_even, mask_full), denom_even, mask_full), neg_half, mask_full)
-                        sq_grad_odd = S.vmul(S.vdiv(S.vmul(rms_grad_odd, rms_odd, mask_full), denom_odd, mask_full), neg_half, mask_full)
-                        S.vsts(sqrsum_grad_ub[pair_idx * 2, 0], sq_grad_even, mask_lane0, 'ONEPT_B32')
-                        S.vsts(sqrsum_grad_ub[pair_idx * 2 + 1, 0], sq_grad_odd, mask_lane0, 'ONEPT_B32')
+                S.mem_bar('VST_VLD')
+                sq_grad_compact = S.alloc_var(T.float32)
+                sq_grad_compact = S.vdup(T.float32(0.0), T.float32, mask_full)
+                for token_offset in T.unroll(token_block, explicit=True):
+                    token_sq_grad = S.vld(sqrsum_grad_ub[token_offset, 0], dist='BRC_B32')
+                    token_mask = S.vcmps(lane_idx, T.int32(token_offset), mask_full, 'eq')
+                    sq_grad_compact = S.vsel(token_sq_grad, sq_grad_compact, token_mask)
+                S.vsts(sqrsum_grad_compact_ub[0], sq_grad_compact, mask_full, 'NORM_B32')
 
-                    S.mem_bar('VST_VLD')
-                    sq_grad_compact = S.alloc_var(T.float32)
-                    sq_grad_compact = S.vdup(T.float32(0.0), T.float32, mask_full)
-                    for token_offset in T.unroll(token_block, explicit=True):
-                        token_sq_grad = S.vld(sqrsum_grad_ub[token_offset, 0], dist='BRC_B32')
-                        token_mask = S.vcmps(lane_idx, T.int32(token_offset), mask_full, 'eq')
-                        sq_grad_compact = S.vsel(token_sq_grad, sq_grad_compact, token_mask)
-                    S.vsts(sqrsum_grad_compact_ub[0], sq_grad_compact, mask_full, 'NORM_B32')
-
-                T.copy(out_mul_grad_ub[:, :mhc_mult3], out_mul_grad[token_base : token_base + token_block, 0, :mhc_mult3])
-                T.copy(sqrsum_grad_compact_ub[:token_block], sqrsum_grad[token_base : token_base + token_block, 0])
-            else:
-                for token_offset in T.serial(token_block):
-                    pid = token_base + token_offset
-                    if pid < num_tokens:
-                        with T.SimtVF(threads=32):
-                            sqrsum_frag = T.alloc_fragment(1, T.float32)
-                            sqrsum_frag[0] = sqrsum[pid, 0]
-                            # Match the vectorized main path's
-                            # 1/sqrt(sq * (1/group) + eps) chain bitwise.
-                            inv_rms_group_size = T.float32(1.0 / rms_group_size)
-                            rms = T.float32(1.0) / T.sqrt(sqrsum_frag[0] * inv_rms_group_size + rms_eps)
-
-                            rms_grad_reducer = T.alloc_reducer(1, T.float32, op='sum')
-                            rms_grad_frag = T.alloc_fragment(1, T.float32)
-                            T.reducer_init(rms_grad_reducer)
-                            for j in T.Parallel(32):
-                                if j < mhc_mult3:
-                                    out_mul_grad[pid, 0, j] = out_grad[pid, j] * rms
-                                    T.reducer_update(rms_grad_reducer[0], out_grad[pid, j] * out_mul[pid, 0, j])
-                            T.finalize_reducer(rms_grad_reducer, rms_grad_frag)
-
-                            for i in T.Parallel(1):
-                                sqrsum_grad[pid, 0] = rms_grad_frag[i] * rms / (sqrsum_frag[i] + rms_eps * rms_group_size) / -2
+            T.copy(out_mul_grad_ub[:, :mhc_mult3], out_mul_grad[token_base : token_base + token_block, 0, :mhc_mult3])
+            T.copy(sqrsum_grad_compact_ub[:token_block], sqrsum_grad[token_base : token_base + token_block, 0])

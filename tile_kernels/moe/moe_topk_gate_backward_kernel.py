@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from tile_kernels.config import get_pdl, is_ascend
+from tile_kernels.config import get_num_vec_cores, is_ascend
 from tile_kernels.moe.moe_topk_gate_backward_cuda import get_moe_topk_gate_backward_kernel_cuda
 
 
@@ -77,14 +77,15 @@ def moe_topk_gate_backward(
             num_topk,
             num_routed_experts,
             aux_exists,
+            num_vec_cores=get_num_vec_cores(),
         )
     else:
         kernel = get_moe_topk_gate_backward_kernel_cuda(
             num_topk,
             num_routed_experts,
             aux_exists,
-            use_pdl=get_pdl(),
-        )
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     kernel(
         scores, topk_idx, topk_weights, grad_topk_weights,

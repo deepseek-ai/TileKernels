@@ -5,15 +5,8 @@ import tilelang
 from tilelang import language as T
 
 from tile_kernels.quant.common import *
+from tile_kernels.quant.templates_cuda import EXP_FTZ_SOURCE, PREFETCH_L2_SOURCE, SYMMETRIC_CLAMP_SOURCE, UPPER_CLAMP_SOURCE
 from tile_kernels.utils import is_power_of_two
-
-
-PREFETCH_SOURCE = """
-__device__ __forceinline__ int tk_prefetch_l2(const void* addr) {
-    asm volatile("prefetch.global.L2 [%0];" : : "l"(__cvta_generic_to_global(addr)) : "memory");
-    return 0;
-}
-"""
 
 
 @tilelang.jit(
@@ -47,6 +40,10 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
     group_size = num_threads // num_groups
     use_fast_certificate = in_dtype == T.bfloat16 and out_config.dtype == T.float8_e4m3fn and out_config.round_sf
     prefetch_elems = 128 // in_dtype.bytes
+    # On narrow output stores (e4m3 / bf16), hinting the clamp counters as cold
+    # (`__builtin_expect(..., 0)`) and sharing `tk_upper_clamp` / `tk_symmetric_clamp`
+    # avoids nvcc's speculative IADD3 + conditional-revert IMAD.MOV pair and FSELs.
+    use_fast_clamp_count = out_config.dtype != T.float32
 
     num_iters = T.ceildiv(hidden, group_step)
     if num_iters >= num_sms:
@@ -88,7 +85,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
         clamped_count: T.Tensor[(4,), T.int64],
     ):
         with T.Kernel(num_sms, threads=num_threads) as pid:
-            T.import_source(PREFETCH_SOURCE)
+            T.import_source(PREFETCH_L2_SOURCE + SYMMETRIC_CLAMP_SOURCE + UPPER_CLAMP_SOURCE + EXP_FTZ_SOURCE)
             if use_pdl:
                 T.pdl_sync()
             if pid >= actual_num_sms:
@@ -198,7 +195,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
                             val_l = T.alloc_var(T.float32, init=xl_fp32_local[vi, j])
                             val_r = T.alloc_var(T.float32, init=xr_fp32_local[vi, j])
                             if clamp_value is not None:
-                                if count_clamp:
+                                if count_clamp and not use_fast_clamp_count:
                                     clamp_silu = val_l > clamp_value
                                     val_l = T.Select(clamp_silu, clamp_value, val_l)
                                     counts_local[0] += clamp_silu
@@ -209,16 +206,24 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
                                     counts_local[1] += clamp_upper
                                     counts_local[2] += clamp_lower
                                 else:
-                                    val_l = T.min(val_l, clamp_value)
-                                    val_r = T.max(T.min(val_r, clamp_value), -clamp_value)
+                                    if count_clamp:
+                                        if T.call_extern(T.int64, '__builtin_expect', val_l > clamp_value, 0):
+                                            counts_local[0] += 1
+                                        if T.call_extern(T.int64, '__builtin_expect', val_r > clamp_value, 0):
+                                            counts_local[1] += 1
+                                        if T.call_extern(T.int64, '__builtin_expect', val_r < -clamp_value, 0):
+                                            counts_local[2] += 1
+                                    val_l = T.call_extern(T.float32, 'tk_upper_clamp', val_l, clamp_value)
+                                    val_r = T.call_extern(T.float32, 'tk_symmetric_clamp', val_r, clamp_value)
                             if use_fast_certificate:
+                                # Subnormal exp results round away in 1 + exp(-gate), so FTZ preserves the denominator.
                                 val = T.alloc_var(
                                     T.float32,
                                     init=T.call_extern(
                                         T.float32,
                                         '__fdividef',
                                         val_l,
-                                        1 + T.call_extern(T.float32, '__expf', -val_l),
+                                        1 + T.call_extern(T.float32, 'tk_exp_ftz', -val_l),
                                     )
                                     * val_r,
                                 )
@@ -244,7 +249,7 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
                             for j in T.vectorized(2):
                                 cert_min_l[j] = T.float32(0)
                             # Gate clamp is upper-only, so checking the original gate is
-                            # conservative for the fast __expf error domain (gate > -16).
+                            # conservative for the fast exp error domain (gate > -16).
                             for j in T.vectorized(vec_size):
                                 cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_fp32_local[vi, j])
                             cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
@@ -263,8 +268,8 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
                                         # Clamp counts were already accumulated in the main
                                         # path; fallback recomputes values only and must not
                                         # count the same elements again.
-                                        val_l = T.min(val_l, clamp_value)
-                                        val_r = T.max(T.min(val_r, clamp_value), -clamp_value)
+                                        val_l = T.call_extern(T.float32, 'tk_upper_clamp', val_l, clamp_value)
+                                        val_r = T.call_extern(T.float32, 'tk_symmetric_clamp', val_r, clamp_value)
                                     val = T.alloc_var(T.float32, init=(val_l / (1 + T.exp(-val_l))) * val_r)
                                     if with_weight:
                                         val = val * topk_weights_var

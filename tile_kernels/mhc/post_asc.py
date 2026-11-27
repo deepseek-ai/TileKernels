@@ -2,37 +2,45 @@ import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
-
-# Each bf16 chunk is unpacked into a 64-lane fp32 vector register.
-_VEC = 64
+from tile_kernels.mhc.common_asc import _VEC, _load_f32, _store_f32
 
 
 @tilelang.jit()
-def mhc_post_fwd_asc(comb_res_mix, residual, post_layer_mix, x, out, h_blk, num_vec_cores: int):
+def mhc_post_fwd_asc(
+    comb_res_mix,
+    residual,
+    post_layer_mix,
+    x,
+    out,
+    h_blk,
+    num_vec_cores: int,
+    x_dtype: T.dtype = T.bfloat16,
+):
     """Ascend forward.
 
     ``out[n, mo, h] = post_layer_mix[n, mo] * x[n, h]
                       + sum_mi comb_res_mix[n, mi, mo] * residual[n, mi, h]``
     """
+    assert x_dtype in (T.bfloat16, T.float32), f'{x_dtype=}'
     num_tokens = T.dynamic('num_tokens')
     mhc = T.const('mhc')
     hidden = T.const('hidden')
     comb_res_mix: T.Tensor[(num_tokens, mhc, mhc), T.float32]
-    residual: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    residual: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
     post_layer_mix: T.Tensor[(num_tokens, mhc), T.float32]
-    x: T.Tensor[(num_tokens, hidden), T.bfloat16]
-    out: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    x: T.Tensor[(num_tokens, hidden), x_dtype]
+    out: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
 
     num_hidden_tiles = T.ceildiv(hidden, h_blk)
     num_chunks = h_blk // _VEC
     num_stages = 3
 
     with T.Kernel(num_vec_cores) as core_id:
-        residual_ub = T.alloc_shared((mhc, h_blk), T.bfloat16)
-        x_ub = T.alloc_shared((h_blk,), T.bfloat16)
+        residual_ub = T.alloc_shared((mhc, h_blk), x_dtype)
+        x_ub = T.alloc_shared((h_blk,), x_dtype)
         comb_res_mix_ub = T.alloc_shared((mhc, mhc), T.float32)
         post_layer_mix_ub = T.alloc_shared((T.ceildiv(mhc, 8) * 8,), T.float32)  # TODO remove manual padding
-        out_ub = T.alloc_shared((mhc, h_blk), T.bfloat16)
+        out_ub = T.alloc_shared((mhc, h_blk), x_dtype)
         T.annotate_buffer_versions(
             {
                 residual_ub: num_stages,
@@ -61,22 +69,22 @@ def mhc_post_fwd_asc(comb_res_mix, residual, post_layer_mix, x, out, h_blk, num_
                 res = S.alloc_local((mhc,), T.float32)
                 for c in T.serial(num_chunks):
                     col = c * _VEC
-                    x_f32 = S.vcvt(S.vld(x_ub[col], dist='UNPK_B16'), T.float32, part=0)
+                    x_f32 = _load_f32(x_ub[col])
                     for mi in T.unroll(mhc, explicit=True):
-                        res[mi] = S.vcvt(S.vld(residual_ub[mi, col], dist='UNPK_B16'), T.float32, part=0)
+                        res[mi] = _load_f32(residual_ub[mi, col])
                     for mo in T.unroll(mhc, explicit=True):
                         out_reg[mo] = S.vmul(x_f32, post_mix[mo])
                     for mi in T.unroll(mhc, explicit=True):
                         for mo in T.unroll(mhc, explicit=True):
                             S.vmula(out_reg[mo], res[mi], comb_mix[mi * mhc + mo])
                     for mo in T.unroll(mhc, explicit=True):
-                        S.vsts(out_ub[mo, col], S.vcvt(out_reg[mo], T.bfloat16), dist='PK_B32')
+                        _store_f32(out_ub[mo, col], out_reg[mo])
 
             T.copy(out_ub, out[pid_n, 0, pid_h * h_blk])
 
 
 @tilelang.jit()
-def mhc_post_bwd_asc(d_o, comb_res_mix, residual, post_layer_mix, x, h_blk, num_stages, num_vec_cores: int):
+def mhc_post_bwd_asc(d_o, comb_res_mix, residual, post_layer_mix, x, h_blk, num_stages, num_vec_cores: int, x_dtype: T.dtype = T.bfloat16):
     """Ascend backward.
 
     d_x[n, h] = sum_mo d_o[n, mo, h] * post_layer_mix[n, mo]
@@ -84,31 +92,32 @@ def mhc_post_bwd_asc(d_o, comb_res_mix, residual, post_layer_mix, x, h_blk, num_
     d_residual[n, mi, h] = sum_mo d_o[n, mo, h] * comb_res_mix[n, mi, mo]
     d_comb_res_mix[n, mi, mo] = sum_h d_o[n, mo, h] * residual[n, mi, h]
     """
+    assert x_dtype in (T.bfloat16, T.float32), f'{x_dtype=}'
     num_tokens = T.dynamic('num_tokens')
     mhc = T.const('mhc')
     hidden = T.const('hidden')
-    d_o: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    d_o: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
     comb_res_mix: T.Tensor[(num_tokens, mhc, mhc), T.float32]
-    residual: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    residual: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
     post_layer_mix: T.Tensor[(num_tokens, mhc), T.float32]
-    x: T.Tensor[(num_tokens, hidden), T.bfloat16]
+    x: T.Tensor[(num_tokens, hidden), x_dtype]
 
     d_comb_res_mix = T.empty((num_tokens, mhc, mhc), T.float32)
-    d_residual = T.empty((num_tokens, mhc, hidden), T.bfloat16)
+    d_residual = T.empty((num_tokens, mhc, hidden), x_dtype)
     d_post_layer_mix = T.empty((num_tokens, mhc), T.float32)
-    d_x = T.empty((num_tokens, hidden), T.bfloat16)
+    d_x = T.empty((num_tokens, hidden), x_dtype)
 
     num_hidden_tiles = T.ceildiv(hidden, h_blk)
     num_chunks = h_blk // _VEC
 
     with T.Kernel(num_vec_cores) as core_id:
-        d_o_ub = T.alloc_shared((mhc, h_blk), T.bfloat16)
-        x_ub = T.alloc_shared((h_blk,), T.bfloat16)
-        residual_ub = T.alloc_shared((mhc, h_blk), T.bfloat16)
+        d_o_ub = T.alloc_shared((mhc, h_blk), x_dtype)
+        x_ub = T.alloc_shared((h_blk,), x_dtype)
+        residual_ub = T.alloc_shared((mhc, h_blk), x_dtype)
         comb_res_mix_ub = T.alloc_shared((mhc, mhc), T.float32)
         post_layer_mix_ub = T.alloc_shared((T.ceildiv(mhc, 8) * 8,), T.float32)  # TODO remove manual padding
-        d_x_ub = T.alloc_shared((h_blk,), T.bfloat16)
-        d_residual_ub = T.alloc_shared((mhc, h_blk), T.bfloat16)
+        d_x_ub = T.alloc_shared((h_blk,), x_dtype)
+        d_residual_ub = T.alloc_shared((mhc, h_blk), x_dtype)
         d_post_mix_ub = T.alloc_shared((T.ceildiv(mhc, 8) * 8,), T.float32)  # TODO remove manual padding
         d_comb_mix_ub = T.alloc_shared((mhc, mhc), T.float32)
         post_mix_acc = T.alloc_shared((mhc, _VEC), T.float32)
@@ -162,14 +171,14 @@ def mhc_post_bwd_asc(d_o, comb_res_mix, residual, post_layer_mix, x, h_blk, num_
 
                     for c in T.serial(num_chunks):
                         col = c * _VEC
-                        x_f32 = S.vcvt(S.vld(x_ub[col], dist='UNPK_B16'), T.float32, part=0)
+                        x_f32 = _load_f32(x_ub[col])
                         for mo in T.unroll(mhc, explicit=True):
-                            d_o_reg[mo] = S.vcvt(S.vld(d_o_ub[mo, col], dist='UNPK_B16'), T.float32, part=0)
+                            d_o_reg[mo] = _load_f32(d_o_ub[mo, col])
 
                         d_x_reg = S.vdup(0.0, T.float32)
                         for mo in T.unroll(mhc, explicit=True):
                             S.vmula(d_x_reg, d_o_reg[mo], post_mix[mo])
-                        S.vsts(d_x_ub[col], S.vcvt(d_x_reg, T.bfloat16), dist='PK_B32')
+                        _store_f32(d_x_ub[col], d_x_reg)
 
                         for mo in T.unroll(mhc, explicit=True):
                             post_acc_reg = S.vld(post_mix_acc[mo, 0])
@@ -177,14 +186,14 @@ def mhc_post_bwd_asc(d_o, comb_res_mix, residual, post_layer_mix, x, h_blk, num_
                             S.vsts(post_mix_acc[mo, 0], post_acc_reg)
 
                         for mi in T.unroll(mhc, explicit=True):
-                            res_mi = S.vcvt(S.vld(residual_ub[mi, col], dist='UNPK_B16'), T.float32, part=0)
+                            res_mi = _load_f32(residual_ub[mi, col])
                             for mo in T.unroll(mhc, explicit=True):
                                 d_comb_mix_mi[mo] = S.vld(comb_mix_acc[mi * mhc + mo, 0])
                             d_res_reg = S.vdup(0.0, T.float32)
                             for mo in T.unroll(mhc, explicit=True):
                                 S.vmula(d_res_reg, d_o_reg[mo], comb_mix[mi * mhc + mo])
                                 S.vmula(d_comb_mix_mi[mo], d_o_reg[mo], res_mi)
-                            S.vsts(d_residual_ub[mi, col], S.vcvt(d_res_reg, T.bfloat16), dist='PK_B32')
+                            _store_f32(d_residual_ub[mi, col], d_res_reg)
                             for mo in T.unroll(mhc, explicit=True):
                                 S.vsts(comb_mix_acc[mi * mhc + mo, 0], d_comb_mix_mi[mo])
 

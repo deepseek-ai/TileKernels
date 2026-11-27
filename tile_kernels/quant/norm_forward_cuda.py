@@ -15,47 +15,48 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
     eps: float,
     out_scale: float,
     x_dtype: T.dtype,
+    weight_dtype: T.dtype,
     out_config: CastOutputConfig,
+    rms_group_size: int,
     with_out_bf16: bool = False,
     mega_moe_block_m: int = 0,
     use_pdl: bool = False,
     with_rstd: bool = False,
 ):
-    assert 0 < hidden <= 8192
-    assert out_config.with_sf or out_config.dtype == x_dtype
-    assert not out_config.with_sf or out_config.sf_block == (1, 32)
-    assert not with_out_bf16 or out_config.with_sf
+    num_rms_groups = hidden // rms_group_size
 
-    # A row is split into 16-byte vectors, thread `row_offset` of the row holds vectors `vi * row_threads + row_offset`
-    num_threads = 128
+    # Thread `row_offset` holds vectors `vi * num_threads_per_row + row_offset`; all accesses fit in 16 bytes.
+    num_threads = 256 if rms_group_size > 8192 and not out_config.with_sf and out_config.dtype != x_dtype else 128
     num_elems_per_thread = 32
-    vec_size = math.gcd(16 // x_dtype.bytes, hidden)
-    num_vecs = hidden // vec_size
-    row_threads = min(num_threads, max(min(8, tilelang.next_power_of_2(num_vecs)), tilelang.next_power_of_2(ceil_div(hidden, num_elems_per_thread))))
+    max_num_elems_per_thread = 128
+    vec_size = math.gcd(16 // max(x_dtype.bytes, weight_dtype.bytes, out_config.dtype.bytes), rms_group_size)
+    num_vecs = rms_group_size // vec_size
+    num_threads_per_row = min(
+        num_threads, max(min(8, tilelang.next_power_of_2(num_vecs)), tilelang.next_power_of_2(ceil_div(rms_group_size, num_elems_per_thread)))
+    )
+    assert ceil_div(num_vecs, num_threads_per_row) * vec_size <= max_num_elems_per_thread
 
     num_per_channels = out_config.sf_block[1]
     group_lanes = num_per_channels // vec_size
     num_sf_cols = ceil_div(hidden, num_per_channels)
     packed_sf_pad = out_config.use_packed_ue8m0 and out_config.use_tma_aligned_col_major_sf and num_sf_cols % 4 != 0
     sf_inv_dtype = get_sf_inv_dtype(x_dtype, out_config)
-    if out_config.with_sf:
-        assert hidden % num_per_channels == 0
-    num_thread_vec = ceil_div(num_vecs, row_threads)
-    block_m = num_threads // row_threads
-    warp_threads = min(32, row_threads)
-    num_row_warps = row_threads // warp_threads
-    row_layout = T.Fragment((block_m, row_threads), forward_thread_fn=lambda i, j: i * row_threads + j)
+    num_thread_vec = ceil_div(num_vecs, num_threads_per_row)
+    num_rows = num_threads // num_threads_per_row
+    warp_threads = min(32, num_threads_per_row)
+    num_warps_per_row = num_threads_per_row // warp_threads
+    row_layout = T.Fragment((num_rows, num_threads_per_row), forward_thread_fn=lambda i, j: i * num_threads_per_row + j)
     warp_layout = T.Fragment(
-        (block_m, num_row_warps), forward_thread_fn=lambda i, w, rep: i * row_threads + w * warp_threads + rep, replicate=warp_threads
+        (num_rows, num_warps_per_row), forward_thread_fn=lambda i, w, rep: i * num_threads_per_row + w * warp_threads + rep, replicate=warp_threads
     )
-    warp_reduce_layout = T.Fragment((block_m, num_row_warps, warp_threads), forward_thread_fn=lambda i, w, j: i * row_threads + w * warp_threads + j)
-    row_reduce_layout = T.Fragment((block_m, row_threads, num_row_warps), forward_thread_fn=lambda i, j, w: i * row_threads + j)
+    warp_reduce_layout = T.Fragment(
+        (num_rows, num_warps_per_row, warp_threads), forward_thread_fn=lambda i, w, j: i * num_threads_per_row + w * warp_threads + j
+    )
+    row_reduce_layout = T.Fragment((num_rows, num_threads_per_row, num_warps_per_row), forward_thread_fn=lambda i, j, w: i * num_threads_per_row + j)
 
     mega_sf_tile_rows = 128
     mega_sf_lane_rows = 32
     mega_sf_cols = mega_sf_tile_rows // mega_sf_lane_rows
-    if mega_moe_block_m > 0:
-        assert out_config.with_sf and out_config.round_sf and hidden % mega_sf_tile_rows == 0
     mega_moe_aligned_block_m = align(mega_moe_block_m, mega_sf_tile_rows)
 
     batch = T.dynamic('batch')
@@ -92,12 +93,12 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
         out_sf: T.StridedTensor[(batch, *sf_shape), (out_sf_batch_stride, out_sf_stride, 1), out_config.sf_dtype],
         out_bf16: T.StridedTensor[(batch, num_tokens, hidden), (out_bf16_batch_stride, out_bf16_stride, 1), T.bfloat16],
         mega_moe_sf: T.StridedTensor[(mega_moe_sf_rows, hidden // 128, 4), (4, mega_moe_sf_rows * 4, 1), T.uint8],
-        weight: T.Tensor[(hidden,), x_dtype],
-        rstd: T.Tensor[(batch, num_tokens), T.float32],
+        weight: T.Tensor[(hidden,), weight_dtype],
+        rstd: T.Tensor[(batch, num_tokens * num_rms_groups), T.float32],
         residual: T.StridedTensor[(batch, num_tokens, hidden), (residual_batch_stride, residual_stride, 1), x_dtype],
         residual_out: T.StridedTensor[(batch, num_tokens, hidden), (residual_out_batch_stride, residual_out_stride, 1), x_dtype],
     ):
-        with T.Kernel(T.ceildiv(num_tokens, block_m), batch, threads=num_threads) as (pid_token, batch_id):
+        with T.Kernel(T.ceildiv(num_tokens * num_rms_groups, num_rows), batch, threads=num_threads) as (pid_token, batch_id):
             T.assume(x_stride % 16 == 0)
             T.assume(x_batch_stride % 16 == 0)
             T.assume(out_stride % 16 == 0)
@@ -110,48 +111,50 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
                 T.assume(residual_batch_stride % 16 == 0)
                 T.assume(residual_out_stride % 16 == 0)
                 T.assume(residual_out_batch_stride % 16 == 0)
-            # Keep enough rows in flight for wide rows
-            T.annotate_min_blocks_per_sm(5)
             if use_pdl:
                 T.pdl_sync()
             tid = T.get_thread_binding()
-            row_id = tid // row_threads
-            row_offset = tid % row_threads
-            token_id = pid_token * block_m + row_id
+            row_id = tid // num_threads_per_row
+            row_offset = tid % num_threads_per_row
+            token_id = (pid_token * num_rows + row_id) // num_rms_groups
+            rms_group_id = (pid_token * num_rows + row_id) % num_rms_groups
 
-            sum_partial = T.alloc_fragment((block_m, row_threads), T.float32)
-            warp_reducer = T.alloc_reducer((block_m, num_row_warps), T.float32, op='sum')
-            warp_fragment = T.alloc_fragment((block_m, num_row_warps), T.float32)
-            sum_shared = T.alloc_shared((block_m, num_row_warps), T.float32)
-            row_partial = T.alloc_fragment((block_m, row_threads, num_row_warps), T.float32)
-            sum_reducer = T.alloc_reducer((block_m, row_threads), T.float32, op='sum')
-            sum_fragment = T.alloc_fragment((block_m, row_threads), T.float32)
-            T.annotate_layout({sum_partial: row_layout, warp_fragment: warp_layout, row_partial: row_reduce_layout, sum_fragment: row_layout})
+            sum_partial = T.alloc_fragment((num_rows, num_threads_per_row), T.float32)
+            warp_reducer = T.alloc_reducer((num_rows, num_warps_per_row), T.float32, op='sum')
+            warp_fragment = T.alloc_fragment((num_rows, num_warps_per_row), T.float32)
+            layout_annotations = {sum_partial: row_layout, warp_fragment: warp_layout}
+            if num_warps_per_row > 1:
+                sum_shared = T.alloc_shared((num_rows, num_warps_per_row), T.float32)
+                row_partial = T.alloc_fragment((num_rows, num_threads_per_row, num_warps_per_row), T.float32)
+                sum_reducer = T.alloc_reducer((num_rows, num_threads_per_row), T.float32, op='sum')
+                sum_fragment = T.alloc_fragment((num_rows, num_threads_per_row), T.float32)
+                layout_annotations.update({row_partial: row_reduce_layout, sum_fragment: row_layout})
+            T.annotate_layout(layout_annotations)
             x_local = T.alloc_local((num_thread_vec, vec_size), x_dtype)
             y_fp32_local = T.alloc_local((vec_size,), T.float32)
-            y_local = T.alloc_local((num_thread_vec, vec_size), x_dtype)
             sum_local = T.alloc_local((2,), T.float32)
             if with_residual:
                 residual_local = T.alloc_local((vec_size,), x_dtype)
             if with_weight:
-                weight_local = T.alloc_local((vec_size,), x_dtype)
+                weight_local = T.alloc_local((vec_size,), weight_dtype)
             if out_config.with_sf:
+                y_local = T.alloc_local((num_thread_vec, vec_size), x_dtype)
                 sf_local = T.alloc_local((num_thread_vec,), out_config.sf_dtype)
                 amax_local = T.alloc_local((num_thread_vec,), T.float32)
 
             T.clear(sum_local)
             for vi in T.unroll(num_thread_vec):
-                token_offset = (vi * row_threads + row_offset) * vec_size
-                if token_id < num_tokens and token_offset < hidden:
+                token_offset = (vi * num_threads_per_row + row_offset) * vec_size
+                if token_id < num_tokens and token_offset < rms_group_size:
                     for j in T.vectorized(vec_size):
-                        x_local[vi, j] = x[batch_id, token_id, token_offset + j]
+                        x_local[vi, j] = x[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j]
                     if with_residual:
                         for j in T.vectorized(vec_size):
-                            residual_local[j] = residual[batch_id, token_id, token_offset + j]
+                            residual_local[j] = residual[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j]
                         for j in T.vectorized(vec_size):
                             x_local[vi, j] += residual_local[j]
                         for j in T.vectorized(vec_size):
-                            residual_out[batch_id, token_id, token_offset + j] = x_local[vi, j]
+                            residual_out[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j] = x_local[vi, j]
                 else:
                     T.clear(x_local[vi, :])
                 for j in T.vectorized(vec_size):
@@ -160,46 +163,51 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
             # Reduce RSTD over the threads of the row
             sum_partial[row_id, row_offset] = sum_local[0] + sum_local[1]
             T.reducer_init(warp_reducer)
-            for i, w, j in T.Parallel(block_m, num_row_warps, warp_threads, loop_layout=warp_reduce_layout):
+            for i, w, j in T.Parallel(num_rows, num_warps_per_row, warp_threads, loop_layout=warp_reduce_layout):
                 T.reducer_update(warp_reducer[i, w], sum_partial[i, w * warp_threads + j])
             T.finalize_reducer(warp_reducer, warp_fragment)
-            if row_offset % warp_threads == 0:
-                sum_shared[row_id, row_offset // warp_threads] = warp_fragment[row_id, row_offset // warp_threads]
-            T.sync_threads()
-            # Replicate warp sums per thread so the final reducer needs no further CTA barriers.
-            for i, j, w in T.Parallel(block_m, row_threads, num_row_warps, loop_layout=row_reduce_layout):
-                row_partial[i, j, w] = sum_shared[i, w]
-            T.reducer_init(sum_reducer)
-            for i, j, w in T.Parallel(block_m, row_threads, num_row_warps, loop_layout=row_reduce_layout):
-                T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
-            T.finalize_reducer(sum_reducer, sum_fragment)
-            rstd_value = T.alloc_var(T.float32, init=T.rsqrt(sum_fragment[row_id, row_offset] / hidden + eps))
+            if num_warps_per_row > 1:
+                if row_offset % warp_threads == 0:
+                    sum_shared[row_id, row_offset // warp_threads] = warp_fragment[row_id, row_offset // warp_threads]
+                T.sync_threads()
+                # Replicate warp sums per thread so the final reducer needs no further CTA barriers.
+                for i, j, w in T.Parallel(num_rows, num_threads_per_row, num_warps_per_row, loop_layout=row_reduce_layout):
+                    row_partial[i, j, w] = sum_shared[i, w]
+                T.reducer_init(sum_reducer)
+                for i, j, w in T.Parallel(num_rows, num_threads_per_row, num_warps_per_row, loop_layout=row_reduce_layout):
+                    T.reducer_update(sum_reducer[i, j], row_partial[i, j, w])
+                T.finalize_reducer(sum_reducer, sum_fragment)
+                sum_value = sum_fragment[row_id, row_offset]
+            else:
+                sum_value = warp_fragment[row_id, 0]
+            rstd_value = T.alloc_var(T.float32, init=T.rsqrt(sum_value / rms_group_size + eps))
             if with_rstd and row_offset == 0 and token_id < num_tokens:
-                rstd[batch_id, token_id] = rstd_value
+                rstd[batch_id, token_id * num_rms_groups + rms_group_id] = rstd_value
 
-            # Normalize, rounding to the input dtype
+            # Normalize; quantization rounds to the input dtype first.
             for vi in T.unroll(num_thread_vec):
-                token_offset = (vi * row_threads + row_offset) * vec_size
-                is_valid = token_id < num_tokens and token_offset < hidden
-                if with_weight:
-                    if token_offset < hidden:
-                        for j in T.vectorized(vec_size):
-                            weight_local[j] = weight[token_offset + j]
+                token_offset = (vi * num_threads_per_row + row_offset) * vec_size
+                is_valid = token_id < num_tokens and token_offset < rms_group_size
+                if with_weight and token_offset < rms_group_size:
                     for j in T.vectorized(vec_size):
-                        y_fp32_local[j] = T.float32(x_local[vi, j]) * rstd_value * (T.float32(weight_local[j]) * out_scale)
-                else:
-                    for j in T.vectorized(vec_size):
-                        y_fp32_local[j] = T.float32(x_local[vi, j]) * rstd_value * out_scale
+                        weight_local[j] = weight[rms_group_id * rms_group_size + token_offset + j]
                 for j in T.vectorized(vec_size):
-                    y_local[vi, j] = y_fp32_local[j]
+                    if token_offset < rms_group_size:
+                        normalized = T.float32(x_local[vi, j]) * rstd_value
+                        weight_scale = T.float32(weight_local[j]) * out_scale if with_weight else out_scale
+                        y_fp32_local[j] = normalized * weight_scale
+                    else:
+                        y_fp32_local[j] = 0.0
                 if not out_config.with_sf:
                     if is_valid:
                         for j in T.vectorized(vec_size):
-                            out[batch_id, token_id, token_offset + j] = y_local[vi, j]
+                            out[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j] = y_fp32_local[j]
                 else:
+                    for j in T.vectorized(vec_size):
+                        y_local[vi, j] = y_fp32_local[j]
                     if with_out_bf16 and is_valid:
                         for j in T.vectorized(vec_size):
-                            out_bf16[batch_id, token_id, token_offset + j] = y_local[vi, j]
+                            out_bf16[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j] = y_local[vi, j]
 
                     # Reduce SF over the threads of the group, as in `per_token_cast`
                     # Rounding is monotonic, so the amax of the rounded output is the rounded FP32 amax
@@ -213,20 +221,20 @@ def get_norm_forward_and_per_token_cast_kernel_cuda(
 
             if out_config.with_sf:
                 for vi in T.unroll(num_thread_vec):
-                    token_offset = (vi * row_threads + row_offset) * vec_size
+                    token_offset = (vi * num_threads_per_row + row_offset) * vec_size
                     sf, sf_inv = get_sf_and_inv(amax_local[vi], out_config, sf_inv_dtype)
                     sf_local[vi] = sf
-                    if token_id < num_tokens and token_offset < hidden:
+                    if token_id < num_tokens and token_offset < rms_group_size:
                         for j in T.vectorized(vec_size):
-                            out[batch_id, token_id, token_offset + j] = y_local[vi, j] * sf_inv
+                            out[batch_id, token_id, rms_group_id * rms_group_size + token_offset + j] = y_local[vi, j] * sf_inv
 
             # Store SF after the vector loop, so the vectors are scheduled in a single branch-free region
             if out_config.with_sf:
                 if token_id < num_tokens and row_offset % group_lanes == 0:
                     for vi in T.unroll(num_thread_vec):
-                        token_offset = (vi * row_threads + row_offset) * vec_size
-                        if token_offset < hidden:
-                            sf_col = token_offset // num_per_channels
+                        token_offset = (vi * num_threads_per_row + row_offset) * vec_size
+                        if token_offset < rms_group_size:
+                            sf_col = (rms_group_id * rms_group_size + token_offset) // num_per_channels
                             sf_row, sf_column = get_sf_index(token_id, sf_col, out_config)
                             out_sf[batch_id, sf_row, sf_column] = sf_local[vi]
                             if packed_sf_pad and sf_col == num_sf_cols - 1:

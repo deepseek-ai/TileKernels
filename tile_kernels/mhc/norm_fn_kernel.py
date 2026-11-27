@@ -12,6 +12,13 @@ from tile_kernels.mhc.norm_fn_cuda import (
     mhc_reduce_partials_and_rmsnorm_fwd_cuda,
 )
 
+DEFAULT_N_SPLITS = 16
+
+
+def default_n_splits(k: int) -> int:
+    """Default split-K count for the mHC prenorm GEMM."""
+    return min(DEFAULT_N_SPLITS, k // 256) if is_ascend() else DEFAULT_N_SPLITS
+
 
 # ---------------------------------------------------------------------------
 # Wrapper functions: single entry point for callers.
@@ -57,8 +64,8 @@ def mhc_fn_normw_merge_bwd(fn, normw, out_fn_grad, fn_grad, normw_grad):
             out_fn_grad,
             fn_grad,
             normw_grad,
-            use_pdl=get_pdl(),
-        )
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
 
 def mhc_reduce_partials_and_rmsnorm_fwd(
@@ -74,6 +81,7 @@ def mhc_reduce_partials_and_rmsnorm_fwd(
     if is_ascend():
         from tile_kernels.mhc.norm_fn_asc import mhc_reduce_partials_and_rmsnorm_fwd_asc
 
+        token_block = 32 if out_mul_splitted.shape[1] >= 2048 else 16
         mhc_reduce_partials_and_rmsnorm_fwd_asc(
             out_mul_splitted,
             sqrsum_splitted,
@@ -84,6 +92,7 @@ def mhc_reduce_partials_and_rmsnorm_fwd(
             rms_eps,
             n_splits,
             get_num_vec_cores(),
+            token_block=token_block,
         )
     else:
         mhc_reduce_partials_and_rmsnorm_fwd_cuda(

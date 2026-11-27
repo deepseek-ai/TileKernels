@@ -3,10 +3,10 @@ from typing import Optional
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.config import get_num_vec_cores, is_ascend
 from tile_kernels.quant.common import *
 from tile_kernels.quant.norm_forward_cuda import get_norm_forward_and_per_token_cast_kernel_cuda
-from tile_kernels.utils import align
+from tile_kernels.utils import align, dtype_to_str
 
 
 def norm_forward_and_per_token_cast_impl(
@@ -15,6 +15,7 @@ def norm_forward_and_per_token_cast_impl(
     eps: float,
     fmt: str,
     num_per_channels: Optional[int],
+    rms_group_size: Optional[int],
     residual: Optional[torch.Tensor] = None,
     out_scale: float = 1.0,
     use_tma_aligned_col_major_sf: bool = False,
@@ -33,16 +34,21 @@ def norm_forward_and_per_token_cast_impl(
     num_tokens, hidden = x.shape[-2:]
     batch = x.shape[0] if x.ndim == 3 else 1
     assert hidden > 0
+    rms_group_size = hidden if rms_group_size is None else rms_group_size
+    assert rms_group_size > 0 and hidden % rms_group_size == 0
+    assert rms_group_size == hidden or rms_group_size % 32 == 0
+    assert num_per_channels is None or rms_group_size % num_per_channels == 0
+    num_rms_groups = hidden // rms_group_size
 
     def batched(tensor):
         return tensor.unsqueeze(0) if tensor is not None and x.ndim == 2 else tensor
 
     if weight is not None:
-        assert weight.shape == (hidden,) and weight.dtype == x.dtype and weight.device == x.device and weight.is_contiguous()
+        assert weight.shape == (hidden,) and weight.device == x.device and weight.is_contiguous()
+        assert weight.dtype in (torch.bfloat16, torch.float32)
 
     assert (fmt, num_per_channels) in [('e4m3', 32), ('bf16', None), ('fp32', None)]
     out_config = get_cast_output_config(fmt, (1, num_per_channels or 1), use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0)
-    assert out_config.with_sf or out_config.torch_dtype == x.dtype, 'the unquantized output must match the input dtype'
     assert not out_config.with_sf or hidden % num_per_channels == 0
     assert not with_out_bf16 or out_config.with_sf, 'the extra output is only needed with casting'
 
@@ -55,8 +61,8 @@ def norm_forward_and_per_token_cast_impl(
             if x.ndim == 3:
                 if use_tma_aligned_col_major_sf:
                     # Keep packed hidden padding and TMA token alignment separate for each batch.
-                    sf_pack = get_packed_ue8m0_pack_factor() if use_packed_ue8m0 else 1
-                    alloc_shape = (num_tokens, batch * align(hidden, num_per_channels * sf_pack))
+                    pack_factor = get_packed_ue8m0_pack_factor() if use_packed_ue8m0 else 1
+                    alloc_shape = (num_tokens, batch * align(hidden, num_per_channels * pack_factor))
                 else:
                     alloc_shape = (batch * num_tokens, hidden)
             out_sf = alloc_scaling_factors(alloc_shape, out_config, x.device)
@@ -87,16 +93,18 @@ def norm_forward_and_per_token_cast_impl(
         if tensor is not None:
             assert tensor.shape == x.shape and tensor.dtype == x.dtype and tensor.device == x.device and tensor.stride(-1) == 1
     assert out.shape == x.shape and out.dtype == out_config.torch_dtype and out.device == x.device and out.stride(-1) == 1
-    rstd = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device) if with_rstd else None
+    rstd = torch.empty((batch * num_tokens * num_rms_groups,), dtype=torch.float32, device=x.device) if with_rstd else None
 
     # Get kernel implement
     kernel_kwargs = dict(
         hidden=hidden,
+        rms_group_size=rms_group_size,
         with_weight=weight is not None,
         with_residual=residual is not None,
         eps=eps,
         out_scale=out_scale,
         x_dtype=T.dtype(x.dtype),
+        weight_dtype=T.dtype(x.dtype if weight is None else weight.dtype),
         out_config=out_config,
         with_out_bf16=with_out_bf16,
         with_rstd=with_rstd,
@@ -107,24 +115,26 @@ def norm_forward_and_per_token_cast_impl(
         batched(out_sf),
         batched(out_bf16),
         weight,
-        batched(rstd),
+        rstd.view(batch, num_tokens * num_rms_groups) if rstd is not None else None,
         batched(residual),
         batched(residual_out),
     ]
     if is_ascend():
+        assert rms_group_size % 128 == 0, 'rms_group_size must be a multiple of 128 on Ascend'
         from tile_kernels.quant.norm_forward_asc import get_norm_forward_kernel_asc
 
-        # BF16 padding uses signed 16-bit lane indices in the Ascend kernel.
-        assert x.dtype != torch.bfloat16 or align(hidden, 128) <= 32768, 'Ascend BF16 norm hidden size exceeds 16-bit lane indexing'
+        # BF16 padding uses signed 16-bit lane indices within each block.
+        assert x.dtype != torch.bfloat16 or rms_group_size <= 32768, 'Ascend BF16 RMS group size exceeds 16-bit lane indexing'
         if mega_moe_block_m or mega_moe_sf is not None:
             assert out_config.with_sf and use_packed_ue8m0
         kernel_factory = get_norm_forward_kernel_asc
         kernel_kwargs.update(num_vec_cores=get_num_vec_cores())
     else:
-        assert hidden % 16 == 0 and hidden <= 8192
-        for tensor in (x, out, out_bf16, residual, residual_out):
+        assert hidden % 32 == 0
+        for tensor in (x, out, out_bf16, residual, residual_out, weight):
             if tensor is not None:
                 assert all(stride % 16 == 0 for stride in tensor.stride()[:-1])
+                assert tensor.data_ptr() % 16 == 0, 'the tensors must be 16-byte aligned'
         assert (mega_moe_sf is None) == (mega_moe_block_m == 0)
         if mega_moe_block_m:
             # INT32 (num_tokens, hidden // 128) view of M-major rows, each row padded per `mega_moe_block_m` tokens
@@ -135,7 +145,7 @@ def norm_forward_and_per_token_cast_impl(
             num_mega_moe_sf_rows = mega_moe_sf.stride(1)
             assert ceil_div(num_tokens, mega_moe_block_m) * align(mega_moe_block_m, 128) <= num_mega_moe_sf_rows
         kernel_factory = get_norm_forward_and_per_token_cast_kernel_cuda
-        kernel_kwargs.update(mega_moe_block_m=mega_moe_block_m, use_pdl=get_pdl())
+        kernel_kwargs.update(mega_moe_block_m=mega_moe_block_m, use_pdl=False)  # PDL regression: >=2us slower, keep PDL off.
         args.insert(4, mega_moe_sf)
     if batch * num_tokens > 0:
         if mega_moe_sf is not None and not is_ascend():
@@ -176,14 +186,15 @@ def norm_forward_and_per_token_cast(
     mega_moe_sf: Optional[torch.Tensor] = None,
     mega_moe_block_m: int = 0,
     with_rstd: bool = False,
+    rms_group_size: Optional[int] = None,
 ) -> tuple[QuantTensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
-    """RMSNorm with optional input-dtype residual addition, cast to FP8 with per-token (row-wise) scaling factors.
+    """RMSNorm with optional input-dtype residual addition and per-token FP8 quantization.
 
-    The normalized output is rounded to x.dtype first, so the result equals `per_token_cast` of `norm_forward`.
+    For FP8, the normalized output is rounded to x.dtype first, so the result equals `per_token_cast` of `norm_forward`.
 
     Args:
         x: (num_tokens, hidden) or (batch, num_tokens, hidden), BF16/FP32; last dimension contiguous.
-        weight: Optional (hidden,) tensor matching x.dtype/device; None means unit weight.
+        weight: Optional (hidden,) BF16/FP32 tensor on the same device; None means unit weight.
         eps: Epsilon added to the mean square before reciprocal square root.
         fmt: Target quantized format (``'e4m3'``).
         num_per_channels: Must be 32; hidden must be divisible by 32.
@@ -201,11 +212,13 @@ def norm_forward_and_per_token_cast(
             to a multiple of 128 rows, and the rows of every 128 are transposed as 4 x 32. Rows of padding are untouched.
             Ascend uses packed UE8M0 out_sf instead.
         mega_moe_block_m: Token block size of the mega MoE kernel, required with `mega_moe_sf`.
+        rms_group_size: RMS group width; defaults to hidden. Groups must divide hidden and align to 32 on CUDA or 128 on Ascend.
         with_rstd: Whether to output FP32 rstd. Defaults to False.
 
     Returns:
         A tuple ``((out, out_sf), out_bf16, rstd, norm_input)``: the quantized output and sf factors, the normalized
-        BF16 output (None without `with_out_bf16`), optional FP32 rstd of shape x.shape[:-1], and the residual sum in x.dtype
+        BF16 output (None without `with_out_bf16`), optional flat FP32 rstd with x.numel() // rms_group_size elements,
+        and the residual sum in x.dtype
         (aliasing x without residual).
     """
     out, out_sf = (None, None) if out is None else out
@@ -215,6 +228,7 @@ def norm_forward_and_per_token_cast(
         eps,
         fmt,
         num_per_channels,
+        rms_group_size,
         residual,
         out_scale,
         use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
@@ -240,36 +254,43 @@ def norm_forward(
     out: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
     with_rstd: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
+    rms_group_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """RMSNorm with optional input-dtype residual addition.
 
     Args:
         x: (num_tokens, hidden) or (batch, num_tokens, hidden), BF16/FP32; last dimension contiguous.
-        weight: Optional (hidden,) tensor matching x.dtype/device; None means unit weight.
+        weight: Optional (hidden,) BF16/FP32 tensor on the same device; None means unit weight.
         eps: Epsilon added to the mean square before reciprocal square root.
         residual: Optional tensor matching x; residual_out always rounds to x.dtype.
         out_scale: FP32 multiplier applied to weight before the output product.
-        out: Optional output buffer matching x, with non-overlapping rows.
+        out: Optional output buffer of the requested dtype, with non-overlapping rows.
         residual_out: Optional buffer for x + residual; ignored without residual.
         with_rstd: Whether to output FP32 rstd. Defaults to False.
+        out_dtype: Optional BF16/FP32 dtype of the output. Defaults to x.dtype.
+        rms_group_size: RMS group width; defaults to hidden. Groups must divide hidden and align to 32 on CUDA or 128 on Ascend.
 
-    Supports positive hidden sizes and empty batches. CUDA requires hidden divisible by 16,
-    limits hidden to 8192, and requires row/batch strides divisible by 16.
+    Supports empty batches. CUDA requires hidden divisible by 32
+    and requires 16-byte-aligned tensors and row/batch strides divisible by 16.
     Ascend requires the padded row and enabled fusion buffers to fit in UB;
-    BF16 also limits the padded hidden size to 32768 for lane indexing.
+    BF16 also limits the RMS group size to 32768 for lane indexing. Independent BF16/FP32 input, weight and output dtypes are supported.
     Output buffers must not overlap inputs or each other.
 
     Returns:
-        Output, FP32 rstd of shape x.shape[:-1] (None when with_rstd=False), and the residual sum in x.dtype.
+        Output, optional flat FP32 rstd with x.numel() // rms_group_size elements,
+        and the residual sum in x.dtype. rstd is None when with_rstd=False.
         Without residual the third return value aliases x.
     """
     assert x.dtype in (torch.bfloat16, torch.float32)
+    fmt = dtype_to_str(x.dtype if out_dtype is None else out_dtype)
     out, _, rstd, norm_input = norm_forward_and_per_token_cast_impl(
         x,
         weight,
         eps,
-        'bf16' if x.dtype == torch.bfloat16 else 'fp32',
+        fmt,
         None,
+        rms_group_size,
         residual,
         out_scale,
         out=out,

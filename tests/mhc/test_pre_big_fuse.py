@@ -3,13 +3,14 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tile_kernels.config import get_device, is_ascend
-from tile_kernels.mhc.norm_fn_kernel import mhc_reduce_partials_and_rmsnorm_fwd
+from tile_kernels.config import get_device
+from tile_kernels.mhc.norm_fn_kernel import default_n_splits, mhc_reduce_partials_and_rmsnorm_fwd
 from tile_kernels.mhc.pre_apply_mix_kernel import mhc_pre_apply_mix_fwd
 from tile_kernels.mhc.pre_big_fuse_kernel import mhc_pre_big_fuse_fwd
 from tile_kernels.mhc.pre_split_mixes_kernel import mhc_pre_split_mixes_fwd
 from tile_kernels.mhc.sinkhorn_kernel import mhc_sinkhorn_fwd
 from tile_kernels.rand import randn
+from tile_kernels.testing.generator import generate_hidden_sizes, get_test_level
 from tile_kernels.testing.numeric import count_bytes
 
 
@@ -17,13 +18,16 @@ def generate_big_fuse_test_data(
     n1: int,
     mhc_mult: int,
     hidden_size: int,
-    rms_eps: float = 1e-6,
+    residual_dtype: torch.dtype = torch.bfloat16,
+    rms_eps: float = 1e-20,
     mhc_pre_eps: float = 1e-6,
     mhc_sinkhorn_eps: float = 1e-6,
     mhc_post_mult_value: float = 1.0,
-    sinkhorn_repeat: int = 10,
-    n_splits: int = 16,
+    sinkhorn_repeat: int = 20,
+    n_splits: int | None = None,
 ) -> dict[str, torch.Tensor | float]:
+    if n_splits is None:
+        n_splits = default_n_splits(mhc_mult * hidden_size)
     n0 = 1
     mhc_mult2 = mhc_mult * mhc_mult
     mhc_mult3 = mhc_mult * 2 + mhc_mult2
@@ -32,7 +36,7 @@ def generate_big_fuse_test_data(
     residual = (
         randn((n0, n1, mhc_mult, hidden_size), dtype=torch.float, device=device)
         .mul(1 + torch.arange(mhc_mult, device=device).mul(0.01).view(1, 1, -1, 1))
-        .bfloat16()
+        .to(residual_dtype)
     )
 
     fn = (
@@ -63,12 +67,11 @@ def make_gemm_partials(residual: torch.Tensor, fn: torch.Tensor, n_splits: int) 
 
     The prenorm GEMM itself lives in DeepGEMM now, so its outputs are
     reproduced here: split-K partials of residual @ fn.T plus the squared sum
-    of the residual. Ascend reduces split-K inside the GEMM, so a single
-    partial is produced there.
+    of the residual.
     """
     mhc_mult3, mhc_hidden_size = fn.shape
     num_tokens = residual.shape[0] * residual.shape[1]
-    actual_n_splits = 1 if is_ascend() else n_splits
+    actual_n_splits = n_splits
     split_size = mhc_hidden_size // actual_n_splits
 
     x_flat = residual.float().flatten(2, 3).reshape(num_tokens, mhc_hidden_size)
@@ -97,7 +100,7 @@ def make_big_fuse_runner(
 
     post_mix = torch.empty(*residual.shape[:-2], mhc_mult, 1, dtype=torch.float32, device=device)
     comb_mix = torch.empty(*residual.shape[:-2], mhc_mult, mhc_mult, dtype=torch.float32, device=device)
-    layer_input = torch.empty(*residual.shape[:-2], hidden_size, dtype=torch.bfloat16, device=device)
+    layer_input = torch.empty(*residual.shape[:-2], hidden_size, dtype=residual.dtype, device=device)
 
     def _run() -> None:
         mhc_pre_big_fuse_fwd(
@@ -168,7 +171,7 @@ def big_fuse_reference(
     comb_res_mix_norm = torch.empty_like(comb_res_mix)
     mhc_sinkhorn_fwd(comb_res_mix, comb_res_mix_norm, test_data['sinkhorn_repeat'], test_data['mhc_sinkhorn_eps'])
 
-    layer_input = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    layer_input = torch.empty(num_tokens, hidden_size, dtype=residual.dtype, device=device)
     mhc_pre_apply_mix_fwd(residual.view(num_tokens, mhc_mult, hidden_size), pre_mix, layer_input)
 
     outer_shape = residual.shape[:-2]
@@ -180,17 +183,20 @@ def big_fuse_reference(
 
 
 @pytest.mark.parametrize('n1', [512, 1024, 2048, 8192, 509, 1021])
-@pytest.mark.parametrize('hidden_size', [1280, 2560, 4096, 4096 + 64, 5120])
+@pytest.mark.parametrize('hidden_size', generate_hidden_sizes(max(get_test_level(), 1), ['main']))
 @pytest.mark.parametrize('mhc_mult', [4])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_correctness(
     n1: int,
     hidden_size: int,
     mhc_mult: int,
+    dtype: torch.dtype,
 ) -> None:
     test_data = generate_big_fuse_test_data(
         n1=n1,
         mhc_mult=mhc_mult,
         hidden_size=hidden_size,
+        residual_dtype=dtype,
     )
 
     gemm_out_mul, gemm_out_sqrsum = make_gemm_partials(test_data['residual'], test_data['fn'], test_data['n_splits'])
@@ -205,25 +211,26 @@ def test_correctness(
     assert torch.equal(layer_input_fused, layer_input_ref)
 
 
-_PRE_BIG_FUSE_BENCH_CASES = [
-    (512, 4096),
-    (512, 7168),
-    (8192, 4096),
-    (8192, 5120),
-    (8192, 7168),
-]
+_PRE_BIG_FUSE_BENCH_CASES = [(n1, h) for n1 in (512, 8192) for h in generate_hidden_sizes(1, ['main'])]
 
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize('n1,hidden_size', _PRE_BIG_FUSE_BENCH_CASES)
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_mhc_pre_big_fuse_fwd_benchmark(
     n1: int,
     hidden_size: int,
+    dtype: torch.dtype,
     benchmark_timer,
     benchmark_record,
 ) -> None:
     mhc_mult = 4
-    test_data = generate_big_fuse_test_data(n1=n1, mhc_mult=mhc_mult, hidden_size=hidden_size)
+    test_data = generate_big_fuse_test_data(
+        n1=n1,
+        mhc_mult=mhc_mult,
+        hidden_size=hidden_size,
+        residual_dtype=dtype,
+    )
     residual = test_data['residual']
     fn = test_data['fn']
     mhc_scale = test_data['mhc_scale']
@@ -254,7 +261,12 @@ def test_mhc_pre_big_fuse_fwd_benchmark(
     benchmark_record(
         kernel='mhc_pre_big_fuse_fwd',
         operation='pre_big_fuse_forward',
-        params={'n1': n1, 'hidden_size': hidden_size, 'mhc_mult': mhc_mult},
+        params={
+            'n1': n1,
+            'hidden_size': hidden_size,
+            'mhc_mult': mhc_mult,
+            'dtype': str(dtype),
+        },
         time_us=t_us,
         bandwidth_gbs=io_gb / t_us * 1e6,
         extras={'io_gb': io_gb, 'sinkhorn_repeat': test_data['sinkhorn_repeat']},

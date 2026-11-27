@@ -63,6 +63,12 @@ def pytest_addoption(parser):
         help='Show extras columns (e.g., speedup, …) in the benchmark regression report',
     )
     parser.addoption(
+        '--benchmark-summary-only',
+        action='store_true',
+        default=False,
+        help='Hide the full benchmark comparison table; keep the summary, regressions, improvements and missing baselines',
+    )
+    parser.addoption(
         '-K',
         '--key-filter',
         action='append',
@@ -419,6 +425,7 @@ def pytest_terminal_summary(terminalreporter, config):
     threshold = float(os.environ.get('TK_BENCHMARK_REGRESSION_THRESHOLD', _DEFAULT_BENCHMARK_REGRESSION_THRESHOLD))
     min_delta_us = float(os.environ.get('TK_BENCHMARK_MIN_DELTA_US', _DEFAULT_BENCHMARK_MIN_DELTA_US))
     verbose = config.getoption('--benchmark-verbose')
+    summary_only = config.getoption('--benchmark-summary-only')
 
     tr = terminalreporter
 
@@ -436,9 +443,10 @@ def pytest_terminal_summary(terminalreporter, config):
         tr.write_line('')
 
     tr.section('Benchmark Regression Report')
-    tr.write_line('Ratio = current latency / recorded latency (smaller is better)')
+    if not summary_only:
+        tr.write_line('Ratio = current latency / recorded latency (smaller is better)')
 
-    if baselines:
+    if baselines and not summary_only:
         # Collect extras column names when verbose
         extras_keys = []
         if verbose:
@@ -516,7 +524,7 @@ def pytest_terminal_summary(terminalreporter, config):
             f'{_fmt_bw(geomean_bandwidth):>11} {_fmt_ratio(geomean_ratio):>8} '
             f'{geomean_status:>8}'
         )
-    else:
+    elif not baselines:
         tr.write_line('No baseline file found — skipping regression comparison.')
         tr.write_line(f'  (looked at: {_baselines_dir(config)})')
 

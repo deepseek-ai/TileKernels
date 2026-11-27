@@ -21,7 +21,6 @@ def get_per_block_cast_kernel_asc(
     num_per_tokens, num_per_channels = out_config.sf_block
     assert (num_per_tokens, num_per_channels) == (32, 32)
     assert out_config.dtype in (T.float4_e2m1fn, T.float8_e4m3fn)
-    quant_max = 6.0 if out_config.dtype == T.float4_e2m1fn else 448.0
 
     block_k_limit = 512 if in_config.dtype == T.float32 else 1024
     block_k = align(math.gcd(block_k_limit, hidden), 128)
@@ -50,21 +49,6 @@ def get_per_block_cast_kernel_asc(
         return T.reinterpret(high, 'bfloat16x128')
 
     @T.macro
-    def get_scale_and_inv(amax, fp8_max, inv_fp8_max):
-        if not out_config.round_sf:
-            scale = S.vdiv(amax, fp8_max)
-            return scale, S.vdiv(fp8_max, amax)
-
-        scale_raw = S.vmul(amax, inv_fp8_max)
-        bits = T.reinterpret(scale_raw, 'uint32x64')
-        exp = S.vadds(S.vshrs(S.vsub(bits, S.vdup(1, T.uint32)), 23), 1)
-        scale_bits = S.vshls(exp, 23)
-        scale = T.reinterpret(scale_bits, 'float32x64')
-        inv_exp = S.vsub(S.vdup(254, T.uint32), exp)
-        inv_bits = S.vshls(inv_exp, 23)
-        return scale, T.reinterpret(inv_bits, 'float32x64')
-
-    @T.macro
     def pack_two_block_amax(amax_vec, m_low, m_high):
         a0 = S.vcmax(amax_vec, m_low)
         a1 = S.vcmax(amax_vec, m_high)
@@ -73,9 +57,8 @@ def get_per_block_cast_kernel_asc(
     @T.macro
     def store_scale_pair(sf_ub, sf_row, sf_j, scale01):
         if out_config.use_packed_ue8m0:
-            exponents = S.vshrs(T.reinterpret(scale01, 'uint32x64'), 23)
-            exponent_high = S.vdupv(exponents, pos='POS_HIGHEST')
-            packed_exponents = S.vor(exponents, S.vshls(exponent_high, 8))
+            exponent_high = S.vdupv(scale01, pos='POS_HIGHEST')
+            packed_exponents = S.vor(scale01, S.vshls(exponent_high, 8))
             if out_config.use_tma_aligned_col_major_sf:
                 S.vsts(sf_ub[sf_j // pack_factor, sf_row], T.reinterpret(packed_exponents, 'uint16x128'), dist='ONEPT_B16')
             else:
@@ -99,9 +82,6 @@ def get_per_block_cast_kernel_asc(
             m_low = S.pset(32, 'PAT_VL32')
             m_high = S.vcmps(S.vci(0, T.int32), 31, op='gt')
             one_reg = S.vdup(1.0, T.float32)
-            eps = S.vdup(out_config.clamp_min_value, T.float32)
-            fp8_max = S.vdup(quant_max, T.float32)
-            inv_fp8_max = S.vdup(1.0 / quant_max, T.float32)
             zero_bf16 = S.vdup(0.0, T.bfloat16)
             abs_mask = T.reinterpret(S.vdup(0x7FFF, T.uint16), 'bfloat16x128')
 
@@ -135,8 +115,7 @@ def get_per_block_cast_kernel_asc(
                             for half in T.unroll(2, explicit=True):
                                 amax[half] = S.vmax(amax[half], S.vabs(S.vld(x_ub[row, col + half * 64])))
                     for half in T.unroll(2, explicit=True):
-                        amax[half] = S.vmax(amax[half], eps)
-                        scale, inverse[half] = get_scale_and_inv(pack_two_block_amax(amax[half], m_low, m_high), fp8_max, inv_fp8_max)
+                        scale, inverse[half] = get_sf_and_inv_asc(pack_two_block_amax(amax[half], m_low, m_high), out_config)
                         store_scale_pair(sf_ub, sf_row, sf_col + half * 2, scale)
 
                 if in_config.dtype == T.bfloat16 and out_config.round_sf:
@@ -179,7 +158,9 @@ def get_per_block_cast_kernel_asc(
             x_ub = T.alloc_shared((block_m, block_k), in_config.dtype)
             sf_cols = max(num_stored_sf_cols_per_block, 16 // token_group if out_config.use_packed_ue8m0 else 8)
             if out_config.use_tma_aligned_col_major_sf:
-                sf_ub = T.alloc_shared((sf_cols, token_group), sf_ub_dtype)
+                # Packed SF tails use MTE Normal mode, which requires a 32-byte UB row stride.
+                sf_rows = align(token_group, 32 // sf_ub_dtype.bytes) if out_config.use_packed_ue8m0 else token_group
+                sf_ub = T.alloc_shared((sf_cols, sf_rows), sf_ub_dtype)
             else:
                 sf_ub = T.alloc_shared((token_group, sf_cols), sf_ub_dtype)
             out_ub = T.alloc_shared((block_m, block_k), out_config.dtype)
@@ -199,7 +180,8 @@ def get_per_block_cast_kernel_asc(
                 sf_m_base = T.alloc_var(T.int32, init=pid_x * token_group)
                 sf_k_base = T.alloc_var(T.int32, init=pid_y * num_sf_cols_per_block)
                 stored_sf_k_base = T.alloc_var(T.int32, init=pid_y * num_stored_sf_cols_per_block)
-                for token_offset in T.serial(token_group):
+                valid_tokens = T.alloc_var(T.int32, init=T.min(token_group, num_tokens // block_m - sf_m_base))
+                for token_offset in T.serial(valid_tokens):
                     token_block = sf_m_base + token_offset
                     T.copy(x[token_block * block_m, pid_y * block_k], x_ub[0:block_m, 0:block_k])
                     if cast_only:
@@ -214,7 +196,7 @@ def get_per_block_cast_kernel_asc(
                     else:
                         output_sf = out_sf
                     if out_config.use_tma_aligned_col_major_sf:
-                        T.copy(sf_ub[0:num_stored_sf_cols_per_block, 0:token_group], output_sf[stored_sf_k_base, sf_m_base])
+                        T.copy(sf_ub[0:num_stored_sf_cols_per_block, 0:valid_tokens], output_sf[stored_sf_k_base, sf_m_base])
                     else:
                         T.copy(sf_ub[0:token_group, 0:num_stored_sf_cols_per_block], output_sf[sf_m_base, stored_sf_k_base])
 

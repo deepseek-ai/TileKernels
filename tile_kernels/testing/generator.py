@@ -9,10 +9,6 @@ from tile_kernels.config import get_device_num_sms, get_device
 from tile_kernels.rand import randn
 
 
-def is_precompile() -> bool:
-    return os.getenv('TK_PRECOMPILE', '0') == '1'
-
-
 def get_test_level() -> int:
     """0=core, 1=default, 2=full. Default 1."""
     level = int(os.getenv('TK_TEST_LEVEL', '1'))
@@ -39,9 +35,6 @@ def generate_samples(level: int, **dimensions):
 
 
 def generate_num_tokens(level: int, alignment: int = 1, backward_only: bool = False) -> list[int]:
-    if is_precompile():
-        return [align(128, alignment)]
-
     if level == 0 and backward_only:
         tokens = [8001]
     else:
@@ -51,15 +44,59 @@ def generate_num_tokens(level: int, alignment: int = 1, backward_only: bool = Fa
     return [align(num_tokens, alignment) for num_tokens in tokens]
 
 
-def generate_hidden_sizes(align: int = 64) -> list[int]:
-    base_list = [128, 192, 384, 768, 2048, 2560, 3072, 4096, 6144, 7168]
-    return [hidden_size for hidden_size in base_list if hidden_size % align == 0]
+def generate_hidden_sizes(level: int, usage: list[str], align: int = 64) -> list[int]:
+    """Return sorted, unique widths for the requested model usages. Note
+    that align only takes effect for level 2 corner cases.
+    """
+    sizes_by_usage = {
+        # Model backbone hidden width (D).
+        'main': [5120],
+        # FFN intermediate width (F)
+        'ffn': [2304],
+        # Query low-rank projection width.
+        'q_lora': [1280],
+        # Per-head width for indexer and attention Q/K.
+        'head': [128, 512],
+        # Wv output width within each group.
+        'group': [1024],
+        # Indexer head count.
+        'indexer': [32],
+        # Attention heads per Wv group times head width; Wv weight input width.
+        'wv_input': [4096],
+        # Wv group count times per-group output width.
+        'wv': [8192],
+        # Attention head count times head width.
+        'attn_context': [32768],
+        # Engram embedding width per hash head.
+        'engram_head': [256],
+        # Concatenated Engram embeddings fed into the fused KV projection.
+        'engram_input': [6144],
+        # Vision encoder hidden width.
+        'vision': [1024],
+    }
+    sizes = set()
+    for expression in usage:
+        products = {1}
+        for factor in expression.split('*'):
+            factor = factor.strip()
+            if factor in sizes_by_usage:
+                factor_sizes = sizes_by_usage[factor]
+            elif factor.isascii() and factor.isdecimal() and int(factor) > 0:
+                factor_sizes = [int(factor)]
+            else:
+                raise ValueError(f'Invalid hidden size factor {factor!r} in {expression!r}')
+            products = {left * right for left in products for right in factor_sizes}
+        sizes.update(products)
+    if level >= 2:
+        corner_sizes = [32, 96, 128, 192, 384]
+        sizes.update(size for size in corner_sizes if size % align == 0)
+    return sorted(sizes)
 
 
 def generate_cast_config(level: int, fmt: str) -> list[tuple[bool, bool, bool]]:
     if fmt in ('fp32', 'bf16'):
         return [(False, False, False)]
-    configs = [(True, True, True)]
+    configs = [(True, True, True), (False, True, True)]
     if level >= 1:
         configs = [(False, True, False), (False, False, False)] + configs
     return configs
@@ -77,7 +114,7 @@ def generate_num_sms(level: int) -> list[int]:
 
 def generate_moe_params(level: int) -> Iterable[dict]:
     if level == 0:
-        yield {'num_send_tokens': 4001, 'num_topk': 6, 'num_experts': 32, 'num_ep_ranks': 8}
+        yield {'num_send_tokens': 4001, 'num_topk': 6, 'num_experts': 48, 'num_ep_ranks': 8}
         yield {'num_send_tokens': 4001, 'num_topk': 8, 'num_experts': 4, 'num_ep_ranks': 64}
         return
 
@@ -87,12 +124,12 @@ def generate_moe_params(level: int) -> Iterable[dict]:
         yield {'num_send_tokens': 1, 'num_topk': 8, 'num_experts': 256, 'num_ep_ranks': 8}
 
     extra_num_topk_list = (1, 7) if level >= 2 else ()
-    extra_num_experts_list = (288, 384) if level >= 2 else ()
+    extra_num_experts_list = (256, 288) if level >= 2 else ()
     extra_num_ep_ranks_list = (1, 72, 256) if level >= 2 else ()
 
     for num_tokens in (4001,):
         for num_topk in (2, 6, 8, 9) + extra_num_topk_list:
-            for num_experts in (72, 256) + extra_num_experts_list:
+            for num_experts in (72, 384) + extra_num_experts_list:
                 for num_ep_ranks in (8, 64) + extra_num_ep_ranks_list:
                     if num_experts % num_ep_ranks == 0:
                         yield {
@@ -128,16 +165,6 @@ def generate_psum_layout(params: dict) -> tuple[torch.Tensor, torch.Tensor]:
     num_topk = params['num_topk']
     num_ep_ranks = params['num_ep_ranks']
     alignment = params['alignment']
-
-    if is_precompile():
-        # Keep one real token and pad it to the test's original alignment.  The
-        # alignment is a static kernel parameter (256 for Ascend SwiGLU), so
-        # replacing it globally with 128 would precompile the wrong JIT key.
-        mask = torch.zeros((alignment,), dtype=torch.bool, device=get_device())
-        mask[0] = True
-        psum = torch.full((num_experts,), alignment, dtype=torch.int32, device=get_device())
-        psum[0] = 1
-        return mask, psum
 
     if num_send_tokens == 0:
         return torch.empty((0,), dtype=torch.bool, device=get_device()), torch.zeros((num_experts,), dtype=torch.int32, device=get_device())

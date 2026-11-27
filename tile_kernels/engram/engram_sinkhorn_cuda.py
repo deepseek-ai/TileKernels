@@ -4,11 +4,13 @@ from tilelang import language as T
 from tile_kernels.utils import ceil_div
 
 
-def _choose_sinkhorn_threads(head_dim: int, vec_size: int = 8) -> int:
+def _choose_sinkhorn_config(head_dim: int) -> tuple[int, int]:
     for threads in (128, 64, 32):
-        if head_dim % (threads * vec_size) == 0:
-            return threads
-    raise ValueError(f'No valid thread count for head_dim={head_dim}')
+        if head_dim % (threads * 8) == 0:
+            return threads, 8
+    if head_dim % 128 == 0:
+        return 64, 2
+    raise ValueError(f'No valid thread/vector config for head_dim={head_dim}')
 
 
 @tilelang.jit(
@@ -21,11 +23,12 @@ def get_engram_sinkhorn_momentum_kernel_cuda(
     momentum_dtype: T.dtype,
     nesterov: bool,
     beta1: float,
+    alignment: int,
     use_pdl: bool = False,
 ):
     num_threads = 32
-    vec_size = 8
-    blk_m = num_threads * vec_size
+    assert alignment in (128, 256)
+    blk_m = alignment
     num_rows = T.dynamic('num_rows')
 
     @T.prim_func
@@ -73,8 +76,7 @@ def get_engram_sinkhorn_step_kernel_cuda(
 ):
     """Normalize Sinkhorn rows and write deterministic per-CTA column partials."""
     num_rows = T.dynamic('num_rows')
-    vec_size = 8
-    threads = _choose_sinkhorn_threads(head_dim, vec_size)
+    threads, vec_size = _choose_sinkhorn_config(head_dim)
 
     def fragment_layout(col):
         thread_id = (col // vec_size) % threads
@@ -152,8 +154,8 @@ def get_engram_sinkhorn_step_reduce_kernel_cuda(
     num_ctas: int,
     use_pdl: bool = False,
 ):
-    threads = 64
-    blk_d = 256
+    blk_d = 256 if head_dim % 256 == 0 else 128
+    threads = blk_d // 4
     assert head_dim % blk_d == 0
     num_col_blocks = head_dim // blk_d
     num_batches = 8
@@ -178,13 +180,14 @@ def get_engram_sinkhorn_step_reduce_kernel_cuda(
                         pid * blk_d : (pid + 1) * blk_d,
                     ],
                     col_sumsq_shared,
+                    disable_tma=True,
                 )
 
                 for i in T.Serial(num_rows):
                     for j in T.Parallel(blk_d):
                         col_sumsq_frag[j] += col_sumsq_shared[i, j]
 
-            T.copy(col_sumsq_frag, col_sumsq[pid * blk_d : (pid + 1) * blk_d])
+            T.copy(col_sumsq_frag, col_sumsq[pid * blk_d : (pid + 1) * blk_d], disable_tma=True)
             if use_pdl:
                 T.pdl_trigger()
 
@@ -204,8 +207,7 @@ def get_engram_sinkhorn_finalize_kernel_cuda(
 ):
     """Materialize the final row-normalized Sinkhorn matrix scaled by alpha."""
     num_rows = T.dynamic('num_rows')
-    vec_size = 8
-    threads = _choose_sinkhorn_threads(head_dim, vec_size)
+    threads, vec_size = _choose_sinkhorn_config(head_dim)
 
     def fragment_layout(col):
         thread_id = (col // vec_size) % threads

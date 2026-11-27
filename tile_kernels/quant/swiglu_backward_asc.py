@@ -1,8 +1,10 @@
+from dataclasses import replace
+
 import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
-from tile_kernels.quant.common import CastOutputConfig, get_packed_ue8m0_pack_factor, get_sf_shape
+from tile_kernels.quant.common import CastOutputConfig, get_packed_ue8m0_pack_factor, get_sf_and_inv_asc, get_sf_shape
 from tile_kernels.utils import align
 
 
@@ -24,6 +26,7 @@ def get_swiglu_backward_kernel_asc(
 
     with_quant = out_config.with_sf
     out_dtype = T.bfloat16 if with_quant else out_config.dtype
+    sf_config = replace(out_config, use_packed_ue8m0=False)
 
     if with_quant:
         assert x_dtype == T.float8_e4m3fn
@@ -124,22 +127,6 @@ def get_swiglu_backward_kernel_asc(
         is_nonzero = S.vcmps(z, 0.0, op='ne')
         take_adjacent = S.pxor(take_bits_plus, use_bits_minus, is_nonzero)
         return S.vsel(adjacent, z, take_adjacent)
-
-    @T.macro
-    def get_scale_and_inverse(amax):
-        # Compute one vector of output scales and inverse scales from per-group amax.
-        clamped_amax = S.vmaxs(amax, out_config.clamp_min_value)
-        if out_config.round_sf:
-            exponent_mask = S.vdup(0x7F800000, T.uint32)
-            exponent_carry = S.vdup(0x001FFFFF, T.uint32)
-            inverse_bias = S.vdup(0x83000000, T.uint32)
-            scale_bias = S.vdup(0x04000000, T.uint32)
-            exponent = S.vand(S.vadd(T.reinterpret(clamped_amax, 'uint32x64'), exponent_carry), exponent_mask)
-            scale = T.reinterpret(S.vsub(exponent, scale_bias), 'float32x64')
-            inverse = T.reinterpret(S.vsub(inverse_bias, exponent), 'float32x64')
-            return scale, inverse
-        quant_max = S.vdup(448.0, T.float32)
-        return S.vdiv(clamped_amax, quant_max), S.vdiv(quant_max, clamped_amax)
 
     @T.macro
     def store_fourfold_expanded(dst, offset, value):
@@ -430,8 +417,8 @@ def get_swiglu_backward_kernel_asc(
                                     scale_vector = num_scale_vectors - 1 - scale_vector_index
                                     scale_offset = scale_vector * vec_size
                                     inverse_offset = scale_offset * 4
-                                    x_scale_value, x_inv = get_scale_and_inverse(S.vld(x_quant_scratch_ub[scale_offset]))
-                                    y_scale_value, y_inv = get_scale_and_inverse(S.vld(y_quant_scratch_ub[scale_offset]))
+                                    x_scale_value, x_inv = get_sf_and_inv_asc(S.vld(x_quant_scratch_ub[scale_offset]), sf_config)
+                                    y_scale_value, y_inv = get_sf_and_inv_asc(S.vld(y_quant_scratch_ub[scale_offset]), sf_config)
                                     store_fourfold_expanded(x_quant_scratch_ub, inverse_offset, x_inv)
                                     store_fourfold_expanded(y_quant_scratch_ub, inverse_offset, y_inv)
                                     x_scale_out = S.vmul(x_scale_value, valid_token_vec) if num_experts else x_scale_value

@@ -15,15 +15,17 @@ def mhc_pre_apply_mix_fwd_cuda(
     o,
     n_thr: int = 128,
     h_blk: int = 1024,
+    x_dtype: T.dtype = T.bfloat16,
     use_pdl: bool = False,
 ):
+    assert x_dtype in (T.bfloat16, T.float32)
     n = T.dynamic('n')
     mhc = T.const('mhc')
     h = T.const('h')
 
-    x: T.Tensor[(n, mhc, h), T.bfloat16]
+    x: T.Tensor[(n, mhc, h), x_dtype]
     mix: T.Tensor[(n, mhc), T.float32]
-    o: T.Tensor[(n, h), T.bfloat16]
+    o: T.Tensor[(n, h), x_dtype]
 
     h_ctas = h // h_blk
     with T.Kernel(n * h_ctas, threads=n_thr) as pid:
@@ -34,12 +36,12 @@ def mhc_pre_apply_mix_fwd_cuda(
         mixl = T.alloc_fragment(mhc, T.float32)
         T.copy(mix[pid_n, 0], mixl)
 
-        xs = T.alloc_shared((mhc, h_blk), T.bfloat16)
+        xs = T.alloc_shared((mhc, h_blk), x_dtype)
         xl = T.alloc_fragment((mhc, h_blk), T.float32)
         T.copy(x[pid_n, 0, pid_h * h_blk], xs, disable_tma=True)
         T.copy(xs, xl, disable_tma=True)
 
-        os = T.alloc_shared(h_blk, T.bfloat16)
+        os = T.alloc_shared(h_blk, x_dtype)
         ol = T.alloc_fragment(h_blk, T.float32)
         T.clear(ol)
 
@@ -61,16 +63,18 @@ def mhc_pre_apply_mix_bwd_cuda(
     x_grad,
     n_thr: int = 128,
     h_blk: int = 1024,
+    x_dtype: T.dtype = T.bfloat16,
     use_pdl: bool = False,
 ):
+    assert x_dtype in (T.bfloat16, T.float32)
     n = T.dynamic('n')
     mhc = T.const('mhc')
     h = T.const('h')
 
-    o_grad: T.Tensor[(n, h), T.bfloat16]
-    x: T.Tensor[(n, mhc, h), T.bfloat16]
+    o_grad: T.Tensor[(n, h), x_dtype]
+    x: T.Tensor[(n, mhc, h), x_dtype]
     mix: T.Tensor[(n, mhc), T.float32]
-    x_grad: T.Tensor[(n, mhc, h), T.bfloat16]
+    x_grad: T.Tensor[(n, mhc, h), x_dtype]
 
     mix_grad = T.empty((n, mhc), T.float32)
 
@@ -78,24 +82,24 @@ def mhc_pre_apply_mix_bwd_cuda(
         if use_pdl:
             T.pdl_sync()
         mixl = T.alloc_fragment(mhc, T.float32)
-        T.copy(mix[pid_n, 0], mixl, disable_tma=True)
+        T.copy(mix[pid_n, :], mixl, disable_tma=True)
 
         mgl_reducer = T.alloc_reducer(mhc, T.float32, op='sum')
         mgl_result = T.alloc_fragment(mhc, T.float32)
         T.reducer_init(mgl_reducer)
 
         for i0_h in T.Pipelined(h // h_blk, num_stages=2):
-            ogs = T.alloc_shared(h_blk, T.bfloat16)
+            ogs = T.alloc_shared(h_blk, x_dtype)
             ogl = T.alloc_fragment(h_blk, T.float32)
             T.copy(o_grad[pid_n, i0_h * h_blk], ogs, disable_tma=True)
             T.copy(ogs, ogl, disable_tma=True)
 
-            xs = T.alloc_shared((mhc, h_blk), T.bfloat16)
+            xs = T.alloc_shared((mhc, h_blk), x_dtype)
             xl = T.alloc_fragment((mhc, h_blk), T.float32)
             T.copy(x[pid_n, 0, i0_h * h_blk], xs, disable_tma=True)
             T.copy(xs, xl, disable_tma=True)
 
-            xgs = T.alloc_shared((mhc, h_blk), T.bfloat16)
+            xgs = T.alloc_shared((mhc, h_blk), x_dtype)
             xgl = T.alloc_fragment((mhc, h_blk), T.float32)
             T.copy(x_grad[pid_n, 0, i0_h * h_blk], xgs, disable_tma=True)
             T.copy(xgs, xgl, disable_tma=True)

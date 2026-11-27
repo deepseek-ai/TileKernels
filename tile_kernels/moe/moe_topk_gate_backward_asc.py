@@ -2,13 +2,12 @@ import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
-from tile_kernels.config import get_num_vec_cores
 from tile_kernels.moe.sqrt_softplus import sqrt_softplus_backward_asc
 from tile_kernels.utils import align
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True})
-def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int, aux_exists: bool):
+def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int, aux_exists: bool, num_vec_cores: int):
     num_stages = 2
     vector_length = 64  # SIMD vector length (float32 lanes per vreg)
     max_num_topk = 32  # Keep the same top-k limit as forward.
@@ -19,7 +18,6 @@ def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int
     rows_per_vec = vector_length // topk_width
     idx_stride = align(num_topk * 2, 8)  # int64 indices viewed as pairs of int32.
     weight_stride = align(num_topk, 8)
-    num_vec_cores = get_num_vec_cores()
     assert num_topk <= max_num_topk
     num_aligned_experts = align(num_routed_experts, vector_length)
     num_vregs = num_aligned_experts // vector_length
@@ -88,7 +86,6 @@ def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int
                 with T.SimdVF():
                     lanes = S.vci(0, T.int32)
                     zero = S.vdup(0.0, T.float32)
-                    one = S.vdup(1.0, T.float32)
                     local_row = S.vshrs(lanes, reduction_steps)
                     local_k = S.vand(lanes, S.vdup(topk_width - 1, T.int32))
                     idx_offsets = T.reinterpret(S.vadd(S.vmuls(local_row, idx_stride), S.vmuls(local_k, 2)), 'uint32x64')
@@ -120,7 +117,7 @@ def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int
                         # Fixed routing may repeat experts; sum their gradients before a single scatter write.
                         combined = T.alloc_var(zero.dtype, init=zero)
                         last_lane = T.alloc_var(lanes.dtype, init=S.vdup(-1, T.int32))
-                        for k in T.unroll(num_topk, explicit=True):
+                        for k in T.serial(num_topk):
                             selector = S.vadds(S.vmuls(local_row, topk_width), k)
                             same = S.vcmp(idx, S.vselr(idx, selector), op='eq')
                             combined = S.vadd(combined, S.vsel(S.vselr(delta, selector), zero, same))
@@ -131,8 +128,11 @@ def get_moe_topk_gate_backward_kernel_asc(num_topk: int, num_routed_experts: int
                         S.vscatter(combined, grad_ub[row_base, 0], score_offsets, unique)
                     S.mem_bar('VST_VLD')
 
-                    # Add the dense auxiliary gradient to the routed gradient before applying the activation derivative.
-                    if aux_exists:
+                if aux_exists:
+                    with T.SimdVF():
+                        lanes = S.vci(0, T.int32)
+                        zero = S.vdup(0.0, T.float32)
+                        one = S.vdup(1.0, T.float32)
                         hrow = T.alloc_var(T.int32, init=0)
                         boundary = T.alloc_var(T.int32, init=(seq_first + 1) * tokens_per_seq - row_start)
                         for row in T.serial(tile_rows):

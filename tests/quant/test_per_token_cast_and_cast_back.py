@@ -34,9 +34,9 @@ def generate_test_params(level: int) -> list[dict]:
             'use_e4m3_sf': use_e4m3_sf,
         }
         for num_tokens in generate_num_tokens(level)
-        for hidden_size in generate_hidden_sizes(128 if is_ascend() else 64)
+        for hidden_size in generate_hidden_sizes(level, ['head'], align=128 if is_ascend() else 64)
         for in_dtype in ('bf16', 'fp32')
-        for num_per_channels in ((16, 32) if is_ascend() else (16, 32, 64, 128))
+        for num_per_channels in (16, 32)
         for fmt in ('e4m3', 'e2m1')
         for round_sf, use_e4m3_sf in (((False, True), (True, False)) if level == 0 else ((False, True), (True, False), (False, False)))
         if not is_ascend() or (num_per_channels, use_e4m3_sf) in ((16, True), (32, False))

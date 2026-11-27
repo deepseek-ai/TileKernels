@@ -29,7 +29,7 @@ def generate_test_params(level: int) -> list[dict]:
     sizes = {
         num_tokens * hidden_size + offset
         for num_tokens in generate_num_tokens(level)
-        for hidden_size in generate_hidden_sizes(128)
+        for hidden_size in generate_hidden_sizes(level, ['main'], align=128)
         for offset in ((0,) if level == 0 else (0, 256, 128, 32, 4, 1))
     }
     sizes.update((2**27, 2**27 + 128, LARGE_CAST_NUMEL, LARGE_CAST_NUMEL + 128))

@@ -3,11 +3,12 @@ from tilelang import language as T
 
 
 @tilelang.jit
-def expand_to_mhc_fwd_cuda(x, o, use_pdl: bool = False):
+def expand_to_mhc_fwd_cuda(x, o, dtype: T.dtype = T.bfloat16, use_pdl: bool = False):
+    assert dtype in (T.bfloat16, T.float32)
     n = T.dynamic('n')
     h, mhc = T.const('h, mhc')
-    x: T.Tensor[(n, h), T.bfloat16]
-    o: T.Tensor[(n, mhc, h), T.bfloat16]
+    x: T.Tensor[(n, h), dtype]
+    o: T.Tensor[(n, mhc, h), dtype]
 
     blk_n = 32
     blk_h = 128
@@ -15,7 +16,7 @@ def expand_to_mhc_fwd_cuda(x, o, use_pdl: bool = False):
     with T.Kernel(T.ceildiv(n, blk_n), T.ceildiv(h, blk_h)) as (pid_i, pid_j):
         if use_pdl:
             T.pdl_sync()
-        xl = T.alloc_fragment((blk_n, blk_h), T.bfloat16)
+        xl = T.alloc_fragment((blk_n, blk_h), dtype)
         T.copy(x[pid_i * blk_n, pid_j * blk_h], xl)
         for m in T.serial(mhc):
             for ti, tj in T.Parallel(blk_n, blk_h):
@@ -28,13 +29,14 @@ def expand_to_mhc_fwd_cuda(x, o, use_pdl: bool = False):
 
 
 @tilelang.jit
-def expand_to_mhc_bwd_cuda(o_grad, x_grad, use_pdl: bool = False):
+def expand_to_mhc_bwd_cuda(o_grad, x_grad, dtype: T.dtype = T.bfloat16, use_pdl: bool = False):
+    assert dtype in (T.bfloat16, T.float32)
     n = T.dynamic('n')
     h, mhc = T.const('h, mhc')
-    o_grad: T.Tensor[(n, mhc, h), T.bfloat16]
-    x_grad: T.Tensor[(n, h), T.bfloat16]
+    o_grad: T.Tensor[(n, mhc, h), dtype]
+    x_grad: T.Tensor[(n, h), dtype]
 
-    blk_n = 32
+    blk_n = 16
     blk_h = 128
 
     with T.Kernel(T.ceildiv(n, blk_n), T.ceildiv(h, blk_h)) as (pid_i, pid_j):

@@ -121,7 +121,7 @@ def get_moe_topk_gate_forward_kernel_asc(
                 T.clear(invalid_logits_ub)
             num_rows = T.min(block_m, T.max(1, T.ceildiv(num_tokens, num_vec_cores)))
             for tile_id in T.Persistent([T.ceildiv(num_tokens, num_rows)], num_vec_cores, core_id,
-                                        num_stages=num_stages, annotations={'multi_buffer_eligible': outputs}):
+                                        group_size=1, num_stages=num_stages, annotations={'multi_buffer_eligible': outputs}):
                 row_start = tile_id * num_rows
                 T.copy(logits[row_start:row_start + num_rows, :], scores_w_bias_ub[:num_rows, :num_routed_experts])
                 if mask_exists:
@@ -155,7 +155,7 @@ def get_moe_topk_gate_forward_kernel_asc(
                                 invalid_idx = S.vcmps(fixed_idx, 0, topk_lanes, op='lt')
                                 invalid = S.vmax(invalid, S.vsel(S.vdup(1, T.int32), zeros, invalid_idx))
                         active_lanes = S.vcmps(S.vdup(T.cast(active, T.int32), T.int32), 0, op='ne')
-                        for j in T.serial(num_vregs):
+                        for j in (T.unroll(num_vregs, unroll_factor=1) if fix_routing_mask_exists else T.serial(num_vregs)):
                             valid = S.vcmps(S.vadds(lanes, j * vector_length), num_routed_experts, op='lt')
                             logit = T.alloc_var(T.float32x64, init=S.vld(scores_w_bias_ub[row, j * vector_length]))
                             if not experts_aligned:

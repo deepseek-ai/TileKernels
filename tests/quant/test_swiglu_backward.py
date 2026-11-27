@@ -74,12 +74,8 @@ def generate_test_params(level: int) -> list[dict]:
         }
         for moe in generate_moe_params(level)
         for fmt in ('e4m3', 'bf16', 'fp32')
-        for num_per_channels in (((32,) if is_ascend() else (32, 128)) if fmt == 'e4m3' else (None,))
-        for hidden_size in (
-            [2048, 3584]
-            if level == 0
-            else [h // 2 for h in generate_hidden_sizes(256 if is_ascend() else max(64, num_per_channels if num_per_channels is not None else 1) * 2)]
-        )
+        for num_per_channels in ((32,) if fmt == 'e4m3' else (None,))
+        for hidden_size in generate_hidden_sizes(level, ['ffn'], align=128 if is_ascend() else max(64, num_per_channels or 1))
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in generate_cast_config(level, fmt)
         for with_psum_layout in ((True,) if level == 0 else (True, False))
         for args in generate_samples(

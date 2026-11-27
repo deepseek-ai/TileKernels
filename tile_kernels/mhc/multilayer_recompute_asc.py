@@ -2,8 +2,7 @@ import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
-
-_VEC = 64
+from tile_kernels.mhc.common_asc import _VEC, _load_f32, _store_f32
 
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False,
@@ -21,14 +20,16 @@ def mhc_multilayer_recompute_asc(
     residual_ptrs,
     h_blk: int,
     num_vec_cores: int,
+    x_dtype: T.dtype = T.bfloat16,
 ):
+    assert x_dtype in (T.bfloat16, T.float32)
     num_tokens = T.dynamic('n')
     mhc = T.const('mhc')
     hidden = T.const('h')
     num_layers = T.const('L')
     num_post_layers = T.const('L_post')
 
-    initial_residual: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    initial_residual: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
     pre_mix_ptrs: T.Tensor[(num_layers,), T.ptr]
     layer_output_ptrs: T.Tensor[(num_post_layers,), T.ptr]
     post_mix_ptrs: T.Tensor[(num_post_layers,), T.ptr]
@@ -41,9 +42,9 @@ def mhc_multilayer_recompute_asc(
     mhc_pad = T.ceildiv(mhc, 8) * 8  # TODO remove manual padding
 
     with T.Kernel(num_vec_cores) as core_id:
-        residual_ub = T.alloc_shared((2, mhc, h_blk), T.bfloat16)
-        layer_output_ub = T.alloc_shared((2, h_blk), T.bfloat16)
-        layer_input_ub = T.alloc_shared((2, h_blk), T.bfloat16)
+        residual_ub = T.alloc_shared((2, mhc, h_blk), x_dtype)
+        layer_output_ub = T.alloc_shared((2, h_blk), x_dtype)
+        layer_input_ub = T.alloc_shared((2, h_blk), x_dtype)
         pre_mix_ub = T.alloc_shared((2, mhc_pad), T.float32)
         post_mix_ub = T.alloc_shared((2, mhc_pad), T.float32)
         comb_mix_ub = T.alloc_shared((2, mhc, mhc), T.float32)
@@ -67,9 +68,9 @@ def mhc_multilayer_recompute_asc(
                 pre_mix_tensor = T.make_tensor(pre_mix_ptrs[l], (num_tokens, mhc), T.float32)
                 post_mix_tensor = T.make_tensor(post_mix_ptrs[l], (num_tokens, mhc), T.float32)
                 comb_mix_tensor = T.make_tensor(comb_mix_ptrs[l], (num_tokens, mhc, mhc), T.float32)
-                layer_output_tensor = T.make_tensor(layer_output_ptrs[l], (num_tokens, hidden), T.bfloat16)
-                layer_input_tensor = T.make_tensor(layer_input_ptrs[l], (num_tokens, hidden), T.bfloat16)
-                residual_tensor = T.make_tensor(residual_ptrs[l], (num_tokens, mhc, hidden), T.bfloat16)
+                layer_output_tensor = T.make_tensor(layer_output_ptrs[l], (num_tokens, hidden), x_dtype)
+                layer_input_tensor = T.make_tensor(layer_input_ptrs[l], (num_tokens, hidden), x_dtype)
+                residual_tensor = T.make_tensor(residual_ptrs[l], (num_tokens, mhc, hidden), x_dtype)
 
                 T.ascend_wait_flag('V_MTE2', input_slot)
                 T.copy(pre_mix_tensor[pid_n, 0], pre_mix_ub[input_slot, 0:mhc])
@@ -96,19 +97,19 @@ def mhc_multilayer_recompute_asc(
                     for chunk_index in T.serial(num_chunks):
                         column_offset = chunk_index * _VEC
                         for mi in T.unroll(mhc, explicit=True):
-                            residual[mi] = S.vcvt(S.vld(residual_ub[input_slot, mi, column_offset], dist='UNPK_B16'), T.float32, part=0)
+                            residual[mi] = _load_f32(residual_ub[input_slot, mi, column_offset])
                         layer_input = S.vmul(residual[0], pre_mix[0])
                         for mi in T.unroll(mhc - 1, explicit=True):
                             S.vmula(layer_input, residual[mi + 1], pre_mix[mi + 1])
-                        S.vsts(layer_input_ub[input_slot, column_offset], S.vcvt(layer_input, T.bfloat16), dist='PK_B32')
-                        layer_output = S.vcvt(S.vld(layer_output_ub[input_slot, column_offset], dist='UNPK_B16'), T.float32, part=0)
+                        _store_f32(layer_input_ub[input_slot, column_offset], layer_input)
+                        layer_output = _load_f32(layer_output_ub[input_slot, column_offset])
                         for mo in T.unroll(mhc, explicit=True):
                             output[mo] = S.vmul(layer_output, post_mix[mo])
                         for mi in T.unroll(mhc, explicit=True):
                             for mo in T.unroll(mhc, explicit=True):
                                 S.vmula(output[mo], residual[mi], comb_mix[mi * mhc + mo])
                         for mo in T.unroll(mhc, explicit=True):
-                            S.vsts(residual_ub[output_slot, mo, column_offset], S.vcvt(output[mo], T.bfloat16), dist='PK_B32')
+                            _store_f32(residual_ub[output_slot, mo, column_offset], output[mo])
                 T.ascend_set_flag('V_MTE2', input_slot)
                 T.ascend_set_flag('V_MTE3', input_slot)
 
@@ -123,7 +124,7 @@ def mhc_multilayer_recompute_asc(
                 final_slot = num_post_layers % 2
                 final_output_slot = 1 - final_slot
                 pre_mix_tensor = T.make_tensor(pre_mix_ptrs[num_post_layers], (num_tokens, mhc), T.float32)
-                layer_input_tensor = T.make_tensor(layer_input_ptrs[num_post_layers], (num_tokens, hidden), T.bfloat16)
+                layer_input_tensor = T.make_tensor(layer_input_ptrs[num_post_layers], (num_tokens, hidden), x_dtype)
                 T.ascend_wait_flag('V_MTE2', final_slot)
                 T.copy(pre_mix_tensor[pid_n, 0], pre_mix_ub[final_slot, 0:mhc])
                 T.ascend_set_flag('MTE2_V', final_slot)
@@ -138,11 +139,11 @@ def mhc_multilayer_recompute_asc(
                     for chunk_index in T.serial(num_chunks):
                         column_offset = chunk_index * _VEC
                         for mi in T.unroll(mhc, explicit=True):
-                            residual[mi] = S.vcvt(S.vld(residual_ub[final_slot, mi, column_offset], dist='UNPK_B16'), T.float32, part=0)
+                            residual[mi] = _load_f32(residual_ub[final_slot, mi, column_offset])
                         layer_input = S.vmul(residual[0], pre_mix[0])
                         for mi in T.unroll(mhc - 1, explicit=True):
                             S.vmula(layer_input, residual[mi + 1], pre_mix[mi + 1])
-                        S.vsts(layer_input_ub[final_slot, column_offset], S.vcvt(layer_input, T.bfloat16), dist='PK_B32')
+                        _store_f32(layer_input_ub[final_slot, column_offset], layer_input)
                 T.ascend_set_flag('V_MTE2', final_slot)
                 T.ascend_set_flag('V_MTE3', final_slot)
                 T.ascend_wait_flag('V_MTE3', final_slot)

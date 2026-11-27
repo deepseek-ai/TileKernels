@@ -39,7 +39,7 @@ def swiglu_forward_and_per_token_cast_impl(
         assert topk_weights is not None, 'routed_scaling_factor requires topk_weights'
 
     # Swiglu forward : hidden -> hidden // 2
-    assert (fmt, num_per_channels) in [('e4m3', 128), ('e4m3', 32), ('bf16', None), ('fp32', None)]
+    assert (fmt, num_per_channels) in [('e4m3', 32), ('bf16', None), ('fp32', None)]
 
     out_config = get_cast_output_config(
         fmt, (1, num_per_channels if num_per_channels != None else 1), use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0

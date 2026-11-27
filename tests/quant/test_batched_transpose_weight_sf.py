@@ -3,7 +3,6 @@ import pytest
 import torch
 
 import tile_kernels
-from tile_kernels.config import is_ascend
 from tile_kernels.testing.generator import generate_rand_float
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 
@@ -22,11 +21,8 @@ _MIXED_WEIGHT_CONFIGS = [
 ]
 
 
-_SKIP_BLOCK128 = pytest.mark.skipif(is_ascend(), reason='Ascend only supports block_size=32')
-
 _CASES = [
     pytest.param(32, _MIXED_WEIGHT_CONFIGS, id='block32-mixed'),
-    pytest.param(128, _MIXED_WEIGHT_CONFIGS, id='block128-mixed', marks=_SKIP_BLOCK128),
 ]
 
 

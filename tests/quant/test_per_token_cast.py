@@ -58,6 +58,12 @@ def generate_test_data(params):
 
 
 def generate_test_params(level: int) -> list[dict]:
+    hidden_sizes = generate_hidden_sizes(
+        level, ['main', 'ffn', '2*ffn', 'q_lora', '128*indexer', 'wv', 'head', 'attn_context', 'engram_head', 'engram_input', '5*main'], align=128
+    )
+    if level == 0:
+        # Too many test cases, take some representative ones on level 0
+        hidden_sizes = hidden_sizes[::4]
     params = [
         {
             'num_tokens': num_tokens,
@@ -72,21 +78,16 @@ def generate_test_params(level: int) -> list[dict]:
             'fmt': fmt,
         }
         for num_tokens in generate_num_tokens(level)
-        for hidden_size in ([3072, 16384, 65536] if level == 0 else generate_hidden_sizes(128))
+        for hidden_size in hidden_sizes
         for use_tma_aligned_col_major_sf in ([True] if level == 0 else [False, True])
         for use_packed_ue8m0 in ([True] if level == 0 else [False, True])
         for round_sf in ([True] if use_packed_ue8m0 else [True, False])
         for in_dtype in ['fp32', 'bf16', 'e4m3', 'e2m1']
-        for num_per_channels in ((32,) if is_ascend() else ((32, 128) if in_dtype in ('e4m3', 'e2m1') else (16, 32, 64, 128)))
+        for num_per_channels in ((32,) if is_ascend() or in_dtype in ('e4m3', 'e2m1') else (16, 32))
         for use_e4m3_sf in ((False,) if (round_sf or is_ascend()) else (False, True))
-        for x_block_size in (
-            (((32, 32),) if in_dtype in ('e4m3', 'e2m1') else (None,))
-            if is_ascend()
-            else (((128, 128), (32, 32)) if in_dtype in ('e4m3', 'e2m1') else (None,))
-        )
+        for x_block_size in (((32, 32),) if in_dtype in ('e4m3', 'e2m1') else (None,))
         for fmt in ('e4m3', 'e2m1')
     ]
-
     return params
 
 
@@ -181,8 +182,8 @@ def test_set_amax_clamp_for_quant():
 
 @pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
 def test_per_token_cast_stochastic(params):
-    if is_ascend():
-        pytest.skip('Ascend per_token_cast with stochastic rounding has not been implemented')
+    if is_ascend() and params['fmt'] != 'e4m3':
+        pytest.skip('Ascend per_token_cast with stochastic rounding only supports E4M3 output')
     hidden = params['hidden']
     num_per_channels = params['num_per_channels']
     use_packed_ue8m0 = params['use_packed_ue8m0']
@@ -267,8 +268,8 @@ def test_per_token_cast_benchmark(benchmark_timer, benchmark_record, params):
 @pytest.mark.benchmark
 @pytest.mark.parametrize('params', generate_test_params(0), ids=make_param_id)
 def test_per_token_cast_stochastic_benchmark(benchmark_timer, benchmark_record, params):
-    if is_ascend():
-        pytest.skip('Ascend per_token_cast with stochastic rounding has not been implemented')
+    if is_ascend() and params['fmt'] != 'e4m3':
+        pytest.skip('Ascend per_token_cast with stochastic rounding only supports E4M3 output')
     num_per_channels = params['num_per_channels']
 
     x, _, base_args, _ = generate_test_data(params)

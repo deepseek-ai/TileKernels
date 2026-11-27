@@ -2,15 +2,19 @@ import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
+from tile_kernels.engram.utils import load_f32
+
 
 @tilelang.jit
 def get_engram_fused_weight_kernel_asc(
     hidden_size: int,
     hc_mult: int,
+    dtype: T.dtype,
     num_vec_cores: int,
 ):
+    assert dtype in (T.bfloat16, T.float32)
     vec_size = 64
-    blk_d = 256
+    blk_d = 256 if hidden_size % 256 == 0 else 128
     num_stages = 3
     assert hidden_size % blk_d == 0
 
@@ -18,13 +22,13 @@ def get_engram_fused_weight_kernel_asc(
 
     @T.prim_func
     def engram_fused_weight_kernel_asc(
-        weight_hidden: T.Tensor[(hc_mult, hidden_size), T.bfloat16],
-        weight_embed: T.Tensor[(hc_mult, hidden_size), T.bfloat16],
+        weight_hidden: T.Tensor[(hc_mult, hidden_size), dtype],
+        weight_embed: T.Tensor[(hc_mult, hidden_size), dtype],
         weight_fused: T.Tensor[(hc_mult, hidden_size), T.float32],
     ):
         with T.Kernel(num_vec_cores) as core_id:
-            hidden_ub = T.alloc_shared((blk_d,), T.bfloat16)
-            embed_ub = T.alloc_shared((blk_d,), T.bfloat16)
+            hidden_ub = T.alloc_shared((blk_d,), dtype)
+            embed_ub = T.alloc_shared((blk_d,), dtype)
             fused_ub = T.alloc_shared((blk_d,), T.float32)
             T.annotate_buffer_versions(
                 {
@@ -48,8 +52,8 @@ def get_engram_fused_weight_kernel_asc(
                 with T.SimdVF():
                     for chunk in T.unroll(blk_d // vec_size, explicit=True):
                         chunk_offset = chunk * vec_size
-                        hidden_f32 = S.vcvt(S.vld(hidden_ub[chunk_offset], dist='UNPK_B16'), T.float32, part=0)
-                        embed_f32 = S.vcvt(S.vld(embed_ub[chunk_offset], dist='UNPK_B16'), T.float32, part=0)
+                        hidden_f32 = load_f32(hidden_ub[chunk_offset])
+                        embed_f32 = load_f32(embed_ub[chunk_offset])
                         S.vsts(fused_ub[chunk_offset], S.vmul(hidden_f32, embed_f32))
 
                 T.copy(fused_ub, weight_fused[head, offset : offset + blk_d])

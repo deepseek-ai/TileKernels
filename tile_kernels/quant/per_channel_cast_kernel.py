@@ -23,10 +23,10 @@ def per_channel_cast(
             Decoded values are data multiplied by the corresponding sf.
             Column-major input SF supports slicing along tokens.
         fmt: Target FP8 format (must be ``'e4m3'``).
-        num_per_tokens: Number of tokens sharing each scaling factor block (``32`` or ``128``).
+        num_per_tokens: Number of tokens sharing each scaling factor block (``32``).
         round_sf: Whether to round scaling factors to powers of two.
         num_per_channels: Number of channels in each input scaling block. Must be
-            ``32`` or ``128`` when ``x`` is a ``QuantTensor``, ``None`` otherwise.
+            ``32`` when ``x`` is a ``QuantTensor``, ``None`` otherwise.
         use_packed_ue8m0: Whether to store sf factors as packed UE8M0 bytes.
 
     Returns:
@@ -38,12 +38,12 @@ def per_channel_cast(
 
     assert fmt == 'e4m3'
     assert x.dim() == 2 and x.is_contiguous()
-    assert num_per_tokens in (32, 128)
+    assert num_per_tokens == 32
     num_tokens, hidden = x.shape
     assert num_tokens % 128 == 0
     assert hidden % 128 == 0, f'Per channel cast requires hidden % 128 == 0, got {hidden}'
     if x_sf_invs is not None:
-        assert num_per_channels in (32, 128)
+        assert num_per_channels == 32
         assert x.dtype == torch.float8_e4m3fn
         assert x_sf_invs.dim() == 2 and x_sf_invs.stride(1) == 1
         assert tuple(x_sf_invs.shape) == get_sf_shape((num_tokens, hidden), in_config)

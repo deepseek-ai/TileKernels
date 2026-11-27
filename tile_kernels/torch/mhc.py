@@ -50,7 +50,7 @@ def mhc_pre_split_mixes_ref(
 
 
 def mhc_pre_apply_mix_ref(x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
-    return (x * mix).sum(-2).bfloat16()
+    return (x * mix).sum(-2).to(x.dtype)
 
 
 def mhc_post_ref(
@@ -59,8 +59,8 @@ def mhc_post_ref(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    term2 = torch.einsum('abmn,abmc->abnc', comb_res_mix, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+    term2 = (comb_res_mix.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(residual.dtype)
 
 
 def mhc_pre_norm_fn_ref(

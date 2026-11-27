@@ -8,7 +8,6 @@ from tile_kernels.utils import str_to_dtype
 from tile_kernels.testing.numeric import assert_equal, count_bytes, check_bias
 from tile_kernels.testing.generator import generate_cast_config, generate_hidden_sizes, generate_num_tokens, generate_rand_float, get_test_level
 from tile_kernels.testing.quant import clear_unused_sf
-from tile_kernels.config import is_ascend
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -47,14 +46,15 @@ def generate_test_params(level: int) -> list[dict]:
             'use_tma_aligned_col_major_sf': use_tma_aligned_col_major_sf,
             'round_sf': round_sf,
             'use_packed_ue8m0': use_packed_ue8m0,
-            'block_size': block_size,
+            'block_size': (32, 32),
         }
-        for num_tokens in generate_num_tokens(level, alignment=128)
-        for hidden_size in generate_hidden_sizes(128)
+        for num_tokens in generate_num_tokens(level, alignment=32)
+        for hidden_size in generate_hidden_sizes(
+            level, ['main', 'ffn', '2*ffn', 'q_lora', '128*indexer', 'wv_input', 'wv', 'engram_input'], align=128
+        )
         for in_dtype in ('bf16', 'fp32')
         for fmt in ('e4m3', 'e2m1')
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in ([(False, True, False)] if level == 0 else generate_cast_config(level, fmt))
-        for block_size in (((32, 32),) if is_ascend() else ((128, 128), (32, 32), (128, 32), (32, 128)))
     ]
 
 
@@ -92,7 +92,7 @@ def test_per_block_cast(params):
     check_bias(x_casted_back, x)
 
     # Test cast only mode
-    if not use_tma_aligned_col_major_sf:
+    if not use_tma_aligned_col_major_sf and not use_packed_ue8m0:
         # TMA aligned or packed ue8m0 sf is used for FP8/FP4 GEMM, not for other cast
         x_casted = tile_kernels.quant.per_block_cast_with_precomputed_sf(**base_args, sf=per_block_sf_inv)
         x_casted_ref = tile_kernels.torch.cast(**base_args, sf=per_block_sf_inv)

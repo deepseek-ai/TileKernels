@@ -3,8 +3,35 @@ from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
 
-# Each bf16 chunk is unpacked into a 64-lane fp32 vector register.
-_VEC = 64
+from tile_kernels.config import get_max_ub_per_vector_core
+from tile_kernels.mhc.common_asc import _VEC, _load_f32, _store_f32
+
+_PARTIAL_VERSIONS = 2
+
+
+def _partial_chunk(
+    n_splits: int,
+    tb: int,
+    h_blk: int,
+    num_stages: int,
+    x_dtype: T.dtype = T.bfloat16,
+    mhc: int = 4,
+) -> int:
+    """Largest power-of-two divisor of n_splits that fits in the remaining UB budget."""
+    mhc2 = mhc * mhc
+    mhc3 = mhc * 2 + mhc2
+    fixed_ub = (
+        (3 + mhc3) * 8 * 4
+        + tb * (mhc * 2 + mhc2) * 4 * num_stages
+        + tb * (mhc + 1) * h_blk * x_dtype.bytes * num_stages
+        + (tb * mhc3 + 64) * 4
+    )  # fmt: skip
+    bytes_per_split = (tb * mhc3 + 64) * 4 * _PARTIAL_VERSIONS
+    max_chunk = (get_max_ub_per_vector_core(use_simt=True) - fixed_ub) // bytes_per_split
+    for chunk in (16, 8, 4, 2, 1):
+        if chunk <= max_chunk and n_splits % chunk == 0:
+            return chunk
+    raise AssertionError(f'pre_big_fuse tile exceeds UB budget ({fixed_ub=} B)')
 
 
 def _u32_index(index_i32):
@@ -41,6 +68,7 @@ def mhc_pre_big_fuse_fwd_asc(
     token_block: int,
     num_stages: int,
     num_vec_cores: int,
+    x_dtype: T.dtype = T.bfloat16,
 ):
     """Ascend fused forward: reduce partials + RMSNorm, split mixes, Sinkhorn, pre-apply.
 
@@ -48,9 +76,6 @@ def mhc_pre_big_fuse_fwd_asc(
     (mhc_reduce_partials_and_rmsnorm_fwd_asc, mhc_pre_split_mixes_fwd_simd_mhc4_asc,
     mhc_sinkhorn_fwd_asc, mhc_pre_apply_mix_fwd_asc) op-for-op so the fused result
     is bitwise identical to the composed path.
-
-    The Ascend HC prenorm GEMM already reduces split-K internally, so only
-    n_splits=1 is supported here.
     """
     num_tokens = T.dynamic('num_tokens')
     hidden = T.const('hidden')
@@ -58,17 +83,17 @@ def mhc_pre_big_fuse_fwd_asc(
     mhc2 = mhc * mhc
     mhc3 = mhc * 2 + mhc2
     assert mhc3 == 24
-    assert n_splits == 1, 'Ascend pre_big_fuse expects the GEMM to reduce split-K internally (n_splits=1)'
+    assert x_dtype in (T.bfloat16, T.float32)
     assert h_blk % _VEC == 0 and hidden % h_blk == 0
 
     gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc3), T.float32]
     gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32]
     mhc_scale: T.Tensor[(3,), T.float32]
     mhc_base: T.Tensor[(mhc3,), T.float32]
-    residual: T.Tensor[(num_tokens, mhc, hidden), T.bfloat16]
+    residual: T.Tensor[(num_tokens, mhc, hidden), x_dtype]
     post_mix: T.Tensor[(num_tokens, mhc), T.float32]
     comb_mix: T.Tensor[(num_tokens, mhc2), T.float32]
-    layer_input: T.Tensor[(num_tokens, hidden), T.bfloat16]
+    layer_input: T.Tensor[(num_tokens, hidden), x_dtype]
 
     tb = token_block
     num_hidden_tiles = hidden // h_blk
@@ -76,27 +101,32 @@ def mhc_pre_big_fuse_fwd_asc(
     # Same compile-time fp32 constant as the reference reduce kernel.
     inv_rms_group_size = T.float32(1.0 / (mhc * hidden))
 
+    compact_vregs = tb * mhc3 // _VEC
+    assert tb * mhc3 % _VEC == 0, 'Ascend big fuse expects token_block * mhc3 divisible by 64'
+    partial_chunk = _partial_chunk(n_splits, tb, h_blk, num_stages, x_dtype, mhc)
+    n_partial_chunks = n_splits // partial_chunk
+
     with T.Kernel(num_vec_cores) as core_id:
         scale_ub = T.alloc_shared((3, 8), T.float32)
         base_ub = T.alloc_shared((mhc3, 8), T.float32)
-        mul_flat_ub = T.alloc_shared((tb * mhc3,), T.float32)
-        mixes_flat_ub = T.alloc_shared((tb * mhc3,), T.float32)
-        sq_ub = T.alloc_shared((tb,), T.float32)
+        gmul_ub = T.alloc_shared((partial_chunk, tb, mhc3), T.float32)
+        gsq_ub = T.alloc_shared((partial_chunk, 64), T.float32)
+        acc_ub = T.alloc_shared((tb * mhc3,), T.float32)
+        sq_acc_ub = T.alloc_shared((64,), T.float32)
         pre_ub = T.alloc_shared((tb, mhc), T.float32)
         post_ub = T.alloc_shared((tb, mhc), T.float32)
         comb_in_ub = T.alloc_shared((tb, mhc2), T.float32)
-        comb_out_ub = T.alloc_shared((tb, mhc2), T.float32)
-        x_ub = T.alloc_shared((tb, mhc, h_blk), T.bfloat16)
-        layer_input_ub = T.alloc_shared((tb, h_blk), T.bfloat16)
+        x_ub = T.alloc_shared((tb, mhc, h_blk), x_dtype)
+        layer_input_ub = T.alloc_shared((tb, h_blk), x_dtype)
         T.annotate_buffer_versions(
             {
-                mul_flat_ub: num_stages,
-                mixes_flat_ub: num_stages,
-                sq_ub: num_stages,
+                gmul_ub: _PARTIAL_VERSIONS,
+                gsq_ub: _PARTIAL_VERSIONS,
+                acc_ub: 1,
+                sq_acc_ub: 1,
                 pre_ub: num_stages,
                 post_ub: num_stages,
                 comb_in_ub: num_stages,
-                comb_out_ub: num_stages,
                 x_ub: num_stages,
                 layer_input_ub: num_stages,
             }
@@ -116,55 +146,67 @@ def mhc_pre_big_fuse_fwd_asc(
             num_stages=num_stages,
         ):
             token_base = pid * tb
-            T.copy(gemm_out_mul[0:1, token_base : token_base + tb, 0:mhc3], T.view(mul_flat_ub, (tb, mhc3)))
-            T.copy(gemm_out_sqrsum[0:1, token_base : token_base + tb], sq_ub)
+            with T.SimdVF():
+                mask_r = S.pset(32)
+                zero_r = S.vdup(T.float32(0.0), T.float32, mask_r)
+                for v in T.unroll(compact_vregs, explicit=True):
+                    S.vsts(acc_ub[v * _VEC], zero_r, mask_r, 'NORM_B32')
+                S.vsts(sq_acc_ub[0], zero_r, mask_r, 'NORM_B32')
+                S.mem_bar('VST_VLD')
+
+            for chunk_idx in T.serial(n_partial_chunks):
+                split_base = chunk_idx * partial_chunk
+                T.copy(
+                    gemm_out_mul[split_base : split_base + partial_chunk, token_base : token_base + tb, 0:mhc3],
+                    gmul_ub,
+                )
+                T.copy(
+                    gemm_out_sqrsum[split_base : split_base + partial_chunk, token_base : token_base + tb],
+                    gsq_ub[:, :tb],
+                )
+
+                with T.SimdVF():
+                    mask_r = S.pset(32)
+                    lane_r = S.vci(T.int32(0), T.int32)
+                    mask_tok = S.vcmps(lane_r, T.int32(tb), mask_r, 'lt')
+                    acc = S.alloc_local((compact_vregs,), T.float32)
+                    acc_sq = S.alloc_var(T.float32)
+                    for vec_idx in T.unroll(compact_vregs, explicit=True):
+                        acc[vec_idx] = S.vld(acc_ub[vec_idx * _VEC])
+                    acc_sq = S.vld(sq_acc_ub[0])
+
+                    for local_split in range(partial_chunk):
+                        for vec_idx in T.unroll(compact_vregs, explicit=True):
+                            acc[vec_idx] = S.vadd(
+                                acc[vec_idx],
+                                S.vld(gmul_ub[local_split, (vec_idx * _VEC) // mhc3, (vec_idx * _VEC) % mhc3]),
+                                mask_r,
+                            )
+                        acc_sq = S.vadd(acc_sq, S.vld(gsq_ub[local_split, 0]), mask_tok)
+
+                    for vec_idx in T.unroll(compact_vregs, explicit=True):
+                        S.vsts(acc_ub[vec_idx * _VEC], acc[vec_idx], mask_r, 'NORM_B32')
+                    if chunk_idx == n_partial_chunks - 1:
+                        ones_r = S.vdup(T.float32(1), T.float32, mask_r)
+                        inv_group_r = S.vdup(inv_rms_group_size, T.float32, mask_r)
+                        acc_sq = S.vdiv(
+                            ones_r,
+                            S.vsqrt(S.vadds(S.vmul(acc_sq, inv_group_r, mask_r), T.float32(rms_eps), mask_r), mask_r),
+                            mask_r,
+                        )
+                    S.vsts(sq_acc_ub[0], acc_sq, mask_r, 'NORM_B32')
+                    S.mem_bar('VST_VLD')
 
             ##################################################################
-            # _mhc_reduce_partials_and_rmsnorm_fwd + _mhc_pre_split_mixes_fwd
-            # + _mhc_sinkhorn_fwd in a single SimdVF phase: the whole latency
-            # path is one unit so the scheduler can overlap it with the
-            # pre-apply memory stream of the previous token block.
+            # _mhc_pre_split_mixes_fwd + _mhc_sinkhorn_fwd
             with T.SimdVF():
                 mask = S.pset(32)
                 ones = S.vdup(T.float32(1), T.float32, mask)
                 zeros = S.vdup(T.float32(0), T.float32, mask)
-                inv_group = S.vdup(inv_rms_group_size, T.float32, mask)
-                lane_idx = S.vci(T.int32(0), T.int32)
+                rms_values = S.vld(sq_acc_ub[0])
 
                 ##################################################################
-                # Phase A: mixes = gemm_out_mul * rms, vectorized with the 6-VR
-                # compact token layout (copied from the reduce kernel).
-                # 16 tokens x 24 mixes = 384 fp32 = 6 VRs of 64 lanes; each
-                # token spans 24 lanes of its VR.
-                for vec_idx in T.unroll(tb * mhc3 // 64, explicit=True):
-                    m_vec = S.vld(mul_flat_ub[vec_idx * 64])
-                    rms_vec = S.alloc_var(T.float32)
-                    rms_vec = zeros
-                    elem_start = vec_idx * 64
-                    elem_end = elem_start + 64
-                    token_start = elem_start // mhc3
-                    token_end = (elem_end - 1) // mhc3
-                    for token_idx in range(token_start, token_end + 1):
-                        sq_val = S.vld(sq_ub[token_idx], dist='BRC_B32')
-                        rms_val = S.vdiv(
-                            ones,
-                            S.vsqrt(S.vadds(S.vmul(sq_val, inv_group, mask), T.float32(rms_eps), mask), mask),
-                            mask,
-                        )
-                        lane_start = token_idx * mhc3 - elem_start
-                        lane_end = lane_start + mhc3
-                        token_mask = S.pand(
-                            S.vcmps(lane_idx, T.int32(lane_start), mask, 'ge'),
-                            S.vcmps(lane_idx, T.int32(lane_end), mask, 'lt'),
-                            mask,
-                        )
-                        rms_vec = S.vsel(rms_val, rms_vec, token_mask)
-                    S.vsts(mixes_flat_ub[vec_idx * 64], S.vmul(m_vec, rms_vec, mask), mask, 'NORM_B32')
-
-                S.mem_bar('VST_VLD')
-
-                ##################################################################
-                # Phase B: split mixes into pre/post/comb (copied from
+                # Split mixes into pre/post/comb (copied from
                 # pre_split_mixes_fwd_simd_mhc4_asc, adjusted for tb tokens).
                 idx = S.vci(T.int32(0), T.int32)
                 col3 = S.vand(idx, S.vdup(T.int32(3), T.int32, mask), mask)
@@ -193,12 +235,13 @@ def mhc_pre_big_fuse_fwd_asc(
                 # pre/post: 16 tokens per VR (4 lanes each)
                 for vec_id in range(tb // 16):
                     token = S.vadd(S.vshrs(idx, T.int32(2), mask), S.vdup(T.int32(vec_id * 16), T.int32, mask), mask)
+                    rms_val = S.vselr(rms_values, token)
                     token_offset = S.vadd(S.vshls(token, T.int32(4), mask), S.vshls(token, T.int32(3), mask), mask)
                     pre_index = S.vadd(token_offset, col3, mask)
                     post_index = S.vadds(pre_index, T.int32(4), mask)
 
                     pre_val = S.vadd(
-                        S.vmul(S.vgather2(mixes_flat_ub[0], _u32_index(pre_index), mask), scale0, mask),
+                        S.vmul(S.vmul(S.vgather2(acc_ub[0], _u32_index(pre_index), mask), rms_val, mask), scale0, mask),
                         pre_base_vec,
                         mask,
                     )
@@ -206,7 +249,7 @@ def mhc_pre_big_fuse_fwd_asc(
                     S.vsts(pre_ub[vec_id * 16, 0], S.vadds(pre_sig, T.float32(mhc_pre_eps), mask), mask, 'NORM_B32')
 
                     post_val = S.vadd(
-                        S.vmul(S.vgather2(mixes_flat_ub[0], _u32_index(post_index), mask), scale1, mask),
+                        S.vmul(S.vmul(S.vgather2(acc_ub[0], _u32_index(post_index), mask), rms_val, mask), scale1, mask),
                         post_base_vec,
                         mask,
                     )
@@ -221,10 +264,11 @@ def mhc_pre_big_fuse_fwd_asc(
                 # comb: 4 tokens per VR (16 lanes each)
                 for vec_id in range(tb // 4):
                     token = S.vadd(S.vshrs(idx, T.int32(4), mask), S.vdup(T.int32(vec_id * 4), T.int32, mask), mask)
+                    rms_val = S.vselr(rms_values, token)
                     token_offset = S.vadd(S.vshls(token, T.int32(4), mask), S.vshls(token, T.int32(3), mask), mask)
                     comb_index = S.vadd(S.vadds(token_offset, T.int32(8), mask), col15, mask)
                     comb_val = S.vadd(
-                        S.vmul(S.vgather2(mixes_flat_ub[0], _u32_index(comb_index), mask), scale2, mask),
+                        S.vmul(S.vmul(S.vgather2(acc_ub[0], _u32_index(comb_index), mask), rms_val, mask), scale2, mask),
                         comb_base_vec,
                         mask,
                     )
@@ -379,13 +423,13 @@ def mhc_pre_big_fuse_fwd_asc(
                         cur_c = S.vselr(tr_c, t_idx)
                         cur_d = S.vselr(tr_d, t_idx)
 
-                    S.vsts(comb_out_ub[g0 * 4, 0], cur_a, mask2)
-                    S.vsts(comb_out_ub[(g0 + 1) * 4, 0], cur_b, mask2)
-                    S.vsts(comb_out_ub[(g0 + 2) * 4, 0], cur_c, mask2)
-                    S.vsts(comb_out_ub[(g0 + 3) * 4, 0], cur_d, mask2)
+                    S.vsts(comb_in_ub[g0 * 4, 0], cur_a, mask2)
+                    S.vsts(comb_in_ub[(g0 + 1) * 4, 0], cur_b, mask2)
+                    S.vsts(comb_in_ub[(g0 + 2) * 4, 0], cur_c, mask2)
+                    S.vsts(comb_in_ub[(g0 + 3) * 4, 0], cur_d, mask2)
 
             T.copy(post_ub[:, 0:mhc], post_mix[token_base : token_base + tb, 0:mhc])
-            T.copy(comb_out_ub, comb_mix[token_base : token_base + tb, 0:mhc2])
+            T.copy(comb_in_ub, comb_mix[token_base : token_base + tb, 0:mhc2])
 
             ##################################################################
             # _mhc_pre_apply_mix_fwd
@@ -408,11 +452,11 @@ def mhc_pre_big_fuse_fwd_asc(
                         for c in T.serial(num_chunks):
                             col = c * _VEC
                             for m in T.unroll(mhc, explicit=True):
-                                xs[m] = S.vcvt(S.vld(x_ub[t, m, col], dist='UNPK_B16'), T.float32, part=0)
+                                xs[m] = _load_f32(x_ub[t, m, col])
                             acc = S.vmul(xs[0], mix_reg[0])
                             for m in T.unroll(mhc - 1, explicit=True):
                                 S.vmula(acc, xs[m + 1], mix_reg[m + 1])
-                            S.vsts(layer_input_ub[t, col], S.vcvt(acc, T.bfloat16), dist='PK_B32')
+                            _store_f32(layer_input_ub[t, col], acc)
 
                 T.copy(
                     layer_input_ub,

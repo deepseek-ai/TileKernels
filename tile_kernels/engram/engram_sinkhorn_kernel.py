@@ -1,7 +1,7 @@
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_num_sms, get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.config import get_num_sms, get_num_vec_cores, is_ascend
 from tile_kernels.engram.engram_sinkhorn_cuda import (
     get_engram_sinkhorn_finalize_kernel_cuda,
     get_engram_sinkhorn_momentum_kernel_cuda,
@@ -19,7 +19,7 @@ def engram_sinkhorn_momentum_update(
     """Update momentum buffer in-place and produce the fp32 tensor consumed by Sinkhorn normalization.
 
     Args:
-        grad: Gradient tensor, shape (numel,), bfloat16 or float32. numel must be a multiple of 256.
+        grad: Gradient tensor, shape (numel,), bfloat16 or float32. numel must be a multiple of 128.
         momentum_buffer: Momentum buffer, shape (numel,), bfloat16 or float32. Modified in-place.
         beta1: Momentum decay coefficient.
         nesterov: If True, write the Nesterov lookahead into ``sinkhorn_input``; otherwise write the updated momentum.
@@ -27,11 +27,11 @@ def engram_sinkhorn_momentum_update(
     Returns:
         sinkhorn_input: Shape (numel,), float32.
     """
-    row_size = 256
     numel = grad.numel()
     assert grad.dtype in (torch.bfloat16, torch.float32), f'unsupported grad dtype: {grad.dtype}'
     assert momentum_buffer.dtype in (torch.bfloat16, torch.float32), f'unsupported momentum dtype: {momentum_buffer.dtype}'
-    assert numel % row_size == 0
+    assert numel % 128 == 0
+    alignment = 256 if numel % 256 == 0 else 128
 
     sinkhorn_input = torch.empty_like(momentum_buffer, dtype=torch.float32)
 
@@ -43,6 +43,7 @@ def engram_sinkhorn_momentum_update(
             T.dtype(momentum_buffer.dtype),
             nesterov,
             beta1,
+            alignment,
             get_num_vec_cores(),
         )
     else:
@@ -51,15 +52,16 @@ def engram_sinkhorn_momentum_update(
             T.dtype(momentum_buffer.dtype),
             nesterov,
             beta1,
-            use_pdl=get_pdl(),
-        )
+            alignment,
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     if numel > 0:
-        num_rows = numel // row_size
+        num_rows = numel // alignment
         kernel(
-            grad.view(num_rows, row_size),
-            momentum_buffer.view(num_rows, row_size),
-            sinkhorn_input.view(num_rows, row_size),
+            grad.view(num_rows, alignment),
+            momentum_buffer.view(num_rows, alignment),
+            sinkhorn_input.view(num_rows, alignment),
         )
 
     return sinkhorn_input
@@ -97,8 +99,8 @@ def engram_sinkhorn_step(
             head_dim,
             eps,
             num_partials,
-            use_pdl=get_pdl(),
-        )
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     col_sumsq_partial = matrix.new_empty((num_partials, head_dim))
     kernel(matrix, row_scale, col_scale, row_norm, col_sumsq_partial)
@@ -130,8 +132,8 @@ def engram_sinkhorn_step_reduce(
         kernel = get_engram_sinkhorn_step_reduce_kernel_cuda(
             head_dim,
             num_partials,
-            use_pdl=get_pdl(),
-        )
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     kernel(col_sumsq_partial, col_sumsq)
 
@@ -171,7 +173,7 @@ def engram_sinkhorn_finalize(
             get_num_vec_cores(),
         )
     else:
-        kernel = get_engram_sinkhorn_finalize_kernel_cuda(head_dim, eps, alpha, use_pdl=get_pdl())
+        kernel = get_engram_sinkhorn_finalize_kernel_cuda(head_dim, eps, alpha, use_pdl=False)  # PDL regression: >=2us slower, keep PDL off.
 
     if rows > 0:
         kernel(matrix, row_scale, col_scale, out)

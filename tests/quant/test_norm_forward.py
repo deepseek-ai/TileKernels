@@ -26,12 +26,13 @@ def generate_test_data(params):
     num_tokens = params['num_tokens']
     hidden = params['hidden']
     dtype = str_to_dtype(params['in_dtype'] or params['fmt'])
+    weight_dtype = str_to_dtype(params['weight_dtype']) if params['weight_dtype'] else dtype
     batch_size = params['batch_size']
     width = align(hidden, 16) + params['row_padding']
     # Batched inputs allocate one extra row so the batch stride exceeds the sliced extent.
     shape = (num_tokens, width) if batch_size is None else (batch_size, num_tokens + 1, width)
     x = randn(shape, dtype=dtype, device=get_device())[..., :num_tokens, :hidden]
-    weight = randn((hidden,), dtype=dtype, device=x.device) if params['use_weight'] else None
+    weight = randn((hidden,), dtype=weight_dtype, device=x.device) if params['use_weight'] else None
     residual = randn(x.shape, dtype=dtype, device=x.device) if params['has_residual'] else None
     mega_moe_sf = None
     if params['mega_moe_block_m']:
@@ -41,11 +42,16 @@ def generate_test_data(params):
 
 
 def generate_test_params(level: int) -> list[dict]:
+    hidden_sizes = generate_hidden_sizes(level, ['main', 'q_lora', 'head', 'group', 'vision', 'engram_input', 'wv'], align=128 if is_ascend() else 64)
+    dtype_combos = [('bf16', None, None), ('fp32', None, None), ('e4m3', 'bf16', None), ('e4m3', 'fp32', None)]
+    dtype_combos += [('fp32', 'bf16', weight_dtype) for weight_dtype in ('bf16', 'fp32')]
+    dtype_combos += [('bf16', 'fp32', weight_dtype) for weight_dtype in ('bf16', 'fp32')]
     params = [
         {
             **args,
             'fmt': fmt,
             'in_dtype': in_dtype,
+            'weight_dtype': weight_dtype,
             'hidden': hidden,
             'num_tokens': num_tokens,
             'use_weight': use_weight,
@@ -55,26 +61,28 @@ def generate_test_params(level: int) -> list[dict]:
             'use_packed_ue8m0': use_packed_ue8m0,
             'eps': eps,
         }
-        for fmt in ('bf16', 'fp32', 'e4m3')
-        for in_dtype in (('bf16', 'fp32') if fmt == 'e4m3' else (None,))
+        for fmt, in_dtype, weight_dtype in dtype_combos
         # The kernels only support the DeepGEMM SF granularity of 32 channels
         for num_per_channels in ((32,) if fmt == 'e4m3' else (None,))
-        for hidden in ([4096, 5120, 7168] if level == 0 else generate_hidden_sizes())
+        for hidden in hidden_sizes
         if num_per_channels is None or hidden % num_per_channels == 0
         for num_tokens in generate_num_tokens(level)
         for eps in (1e-6,)
         for use_weight in (True, False)
+        if use_weight or weight_dtype != 'fp32'
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in generate_cast_config(level, fmt)
         for args in generate_samples(
             level,
+            rms_group_size=(None,) if level == 0 else (None, 128, 1024),
             has_residual=(False, True),
             with_rstd=(True, False),
             batch_size=(None,) if level == 0 else (None, 2),
-            out_scale=(1.0,),
+            out_scale=(1.0,) if level == 0 else (1.0, 0.3),
             row_padding=(16,),
             with_out_bf16=(True, False) if fmt == 'e4m3' else (False,),
             mega_moe_block_m=(192, 0) if not is_ascend() and fmt == 'e4m3' and round_sf and hidden % 128 == 0 else (0,),
         )
+        if args['rms_group_size'] is None or hidden % args['rms_group_size'] == 0
         if not args['mega_moe_block_m'] or args['batch_size'] is None
     ]
     return params
@@ -92,9 +100,19 @@ def test_norm_forward_and_per_token_cast(params):
     mega_moe_block_m = params['mega_moe_block_m']
 
     x, weight, residual, mega_moe_sf = generate_test_data(params)
-    out = torch.empty_strided(x.shape, x.stride(), dtype=torch.bfloat16 if fmt == 'e4m3' else x.dtype, device=x.device)
+    out_dtype = torch.bfloat16 if fmt == 'e4m3' else str_to_dtype(fmt)
+    out = torch.empty_strided(x.shape, x.stride(), dtype=out_dtype, device=x.device)
     residual_out = torch.empty_like(x) if residual is not None else None
-    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=out_scale, residual_out=residual_out, with_rstd=params['with_rstd'])
+    args = dict(
+        x=x,
+        weight=weight,
+        eps=eps,
+        residual=residual,
+        out_scale=out_scale,
+        residual_out=residual_out,
+        with_rstd=params['with_rstd'],
+        rms_group_size=params['rms_group_size'],
+    )
     if fmt == 'e4m3':
         func = lambda quant_out=None: tile_kernels.quant.norm_forward_and_per_token_cast(
             **args,
@@ -108,9 +126,18 @@ def test_norm_forward_and_per_token_cast(params):
             mega_moe_block_m=mega_moe_block_m,
         )
     else:
-        func = lambda: tile_kernels.quant.norm_forward(**args, out=out)
+        func = lambda: tile_kernels.quant.norm_forward(**args, out=out, out_dtype=out_dtype)
 
-    out_ref, rstd_ref, norm_input_ref = norm_forward_ref(x, weight, eps, residual, out_scale)
+    rms_group_size = params['rms_group_size']
+    out_ref, rstd_ref, norm_input_ref = norm_forward_ref(
+        x,
+        weight,
+        eps,
+        residual,
+        out_scale,
+        None if fmt == 'e4m3' else out_dtype,
+        rms_group_size=rms_group_size,
+    )
 
     def check_norm_outputs(norm_out, rstd, norm_input):
         assert norm_out is (out if fmt != 'e4m3' or with_out_bf16 else None)
@@ -137,7 +164,7 @@ def test_norm_forward_and_per_token_cast(params):
     # Test the quantized outputs. FP32 quantization precedes the optional BF16 output conversion.
     normalized = norm_out
     if normalized is None or x.dtype == torch.float32:
-        normalized, _, _ = tile_kernels.quant.norm_forward(x, weight, eps, residual, out_scale)
+        normalized, _, _ = tile_kernels.quant.norm_forward(x, weight, eps, residual, out_scale, rms_group_size=rms_group_size)
         torch.testing.assert_close(normalized, out_ref)
     for output, output_sf, unquantized, out_ref_row in (
         zip(y.unsqueeze(0), sf.unsqueeze(0), normalized.unsqueeze(0), out_ref.unsqueeze(0)) if x.ndim == 2 else zip(y, sf, normalized, out_ref)
@@ -193,7 +220,15 @@ def test_norm_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_re
     mega_moe_block_m = params['mega_moe_block_m']
 
     x, weight, residual, mega_moe_sf = generate_test_data(params)
-    args = dict(x=x, weight=weight, eps=eps, residual=residual, out_scale=params['out_scale'], with_rstd=params['with_rstd'])
+    args = dict(
+        x=x,
+        weight=weight,
+        eps=eps,
+        residual=residual,
+        out_scale=params['out_scale'],
+        with_rstd=params['with_rstd'],
+        rms_group_size=params['rms_group_size'],
+    )
     if fmt == 'e4m3':
         func = lambda: tile_kernels.quant.norm_forward_and_per_token_cast(
             **args,
@@ -205,7 +240,7 @@ def test_norm_forward_and_per_token_cast_benchmark(benchmark_timer, benchmark_re
             mega_moe_block_m=mega_moe_block_m,
         )
     else:
-        func = lambda: tile_kernels.quant.norm_forward(**args)
+        func = lambda: tile_kernels.quant.norm_forward(**args, out_dtype=str_to_dtype(fmt))
     result = func()
     t_us = benchmark_timer(func)
     # Without residual, norm_input aliases x and does not incur another write.

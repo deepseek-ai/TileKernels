@@ -78,10 +78,10 @@ def generate_test_params_per_token(level: int) -> list[dict]:
             'out_dtype': out_dtype,
         }
         for num_tokens in generate_num_tokens(level)
-        for hidden_size in generate_hidden_sizes(align=128)
+        for hidden_size in generate_hidden_sizes(level, ['main', 'ffn', '2*ffn', 'q_lora', '128*indexer', 'wv', 'engram_head'], align=128)
         for fmt in ('e2m1', 'e4m3')
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in generate_cast_config(level, fmt)
-        for num_per_channels in ((32,) if is_ascend() else (16, 32, 64, 128))
+        for num_per_channels in ((32,) if is_ascend() else (16, 32))
         for use_e4m3_sf in ((False,) if (round_sf or is_ascend()) else (False, True))
         for out_dtype in ('fp32', 'bf16')
     ]
@@ -101,11 +101,11 @@ def generate_test_params(level: int) -> list[dict]:
             'num_per_channels': num_per_channels,
         }
         for num_tokens in generate_num_tokens(level)
-        for hidden_size in generate_hidden_sizes(align=64)
+        for hidden_size in generate_hidden_sizes(level, ['main', 'ffn', '2*ffn', 'q_lora', '128*indexer', 'wv_input', 'wv', 'engram_input'], align=64)
         for fmt in ('e2m1', 'e4m3')
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in generate_cast_config(level, fmt)
         for out_dtype in ('bf16', 'fp32')
-        for num_per_tokens, num_per_channels in (((32, 1), (32, 32)) if is_ascend() else ((32, 1), (32, 32), (128, 1), (128, 128)))
+        for num_per_tokens, num_per_channels in ((32, 1), (32, 32))
     ]
 
 

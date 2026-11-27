@@ -1,5 +1,8 @@
 import math
 
+import torch
+from tilelang import language as T
+
 from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
 from tile_kernels.mhc.pre_big_fuse_cuda import mhc_pre_big_fuse_fwd_cuda
 
@@ -23,14 +26,17 @@ def mhc_pre_big_fuse_fwd(
     sinkhorn_repeat: int,
     n_splits: int = 16,
 ):
+    assert residual.dtype in (torch.bfloat16, torch.float32), f'Unsupported residual dtype: {residual.dtype}'
+    assert layer_input.dtype == residual.dtype, f'Expected layer_input.dtype == residual.dtype ({residual.dtype}), got {layer_input.dtype}'
     hidden_size = residual.shape[-1]
+    x_dtype = T.dtype(residual.dtype)
     if is_ascend():
         mhc_mult = residual.shape[-2]
         assert mhc_mult == 4, f'Ascend pre_big_fuse only supports mHC4, got {mhc_mult}'
-        assert gemm_out_mul.shape[0] == 1, 'Ascend pre_big_fuse expects the GEMM to reduce split-K internally (one partial)'
         from tile_kernels.mhc.pre_big_fuse_asc import mhc_pre_big_fuse_fwd_asc
 
-        h_blk = min(math.gcd(512, hidden_size), 256)
+        max_h_blk = 128 if residual.dtype == torch.float32 else 256
+        h_blk = min(math.gcd(512, hidden_size), max_h_blk)
         mhc_pre_big_fuse_fwd_asc(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -46,13 +52,15 @@ def mhc_pre_big_fuse_fwd(
             mhc_post_mult_value,
             sinkhorn_repeat,
             h_blk=h_blk,
-            n_splits=1,
+            n_splits=n_splits,
             token_block=_ASCEND_TOKEN_BLOCK,
             num_stages=4,
             num_vec_cores=get_num_vec_cores(),
+            x_dtype=x_dtype,
         )
     else:
-        hidden_block = math.gcd(512, hidden_size)
+        max_h_blk = 256 if residual.dtype == torch.float32 else 512
+        hidden_block = min(math.gcd(512, hidden_size), max_h_blk)
         mhc_pre_big_fuse_fwd_cuda(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -69,5 +77,6 @@ def mhc_pre_big_fuse_fwd(
             sinkhorn_repeat,
             hidden_block,
             n_splits=n_splits,
+            x_dtype=x_dtype,
             use_pdl=get_pdl(),
         )
