@@ -28,7 +28,7 @@ TileKernels is a library of dozens of highly optimized kernels implemented in [T
   - CUDA Toolkit 13.1 or higher
 - Ascend Backend
   - Ascend 950 NPU
-  - CANN 9.2.0 or higher
+  - CANN 9.3.0 or higher
 
 ## Installation
 
@@ -98,7 +98,7 @@ This code repository is released under [the MIT License](LICENSE).
 ```bibtex
 @misc{tilekernels,
       title={TileKernels},
-      author={Xiangwen Wang, Chenhao Xu, Huanqi Cao, Luotian Huang, Yuxuan Zhou, Weilin Zhao, Rui Tian, Anyi Xu, Fucong Dai, Kuai Yu, Ruifan Xu, Yi Qian, Shengyuan Jia, Chenggang Zhao, Wei Zhang and Lei Wang},
+      author={Xiangwen Wang, Chenhao Xu, Huanqi Cao, Luotian Huang, Yuxuan Zhou, Weilin Zhao, Rui Tian, Anyi Xu, Fucong Dai, Kuai Yu, Ruifan Xu, Yi Qian, Shengyuan Jia, Chenggang Zhao, Chaofan Lin, Wei Zhang and Lei Wang},
       year={2026},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/TileKernels}},

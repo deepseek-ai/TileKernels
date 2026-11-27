@@ -3,11 +3,16 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
-from tilelang import language as T
 
 from tile_kernels.config import get_amax_clamp_for_quant, is_ascend
 from tile_kernels.quant.types import QuantTensor
 from tile_kernels.utils import align, ceil_div, str_to_dtype
+
+if is_ascend():
+    from tilelang.ascend import language as T
+    from tilelang.ascend.language import simd as S
+else:
+    from tilelang import language as T
 
 
 @functools.lru_cache(maxsize=8)
@@ -280,6 +285,41 @@ def get_sf_and_inv(amax: float, out_config: CastOutputConfig, sf_inv_dtype: T.dt
         return T.uint8(exp_sf + 127), sf_inv
     else:
         return T.reinterpret((127 + exp_sf) << 23, T.float32), sf_inv
+
+
+@T.macro
+def _sf_fast_div_asc(clamped, quant_max_vec, quant_max):
+    # 0 ulp fast div for computing sf & inv
+    # scale = clamped / quant_max, inverse = quant_max / clamped
+    # 0 ulp when clamp_min_value >= quant_max * 2**-126, which is promised
+    scale, residual = S.alloc_var(T.float32), S.alloc_var(T.float32)
+    inv_quant_max = 1.0 / quant_max
+    scale = S.vmuls(clamped, inv_quant_max)
+    residual = clamped
+    S.vmula(residual, scale, S.vdup(-quant_max, T.float32))
+    S.vaxpy(scale, residual, inv_quant_max)
+    inverse, residual_inv = S.alloc_var(T.float32), S.alloc_var(T.float32)
+    inverse = S.vdiv(quant_max_vec, clamped, precision='ftz_true')
+    residual_inv = quant_max_vec
+    S.vmula(residual_inv, inverse, S.vneg(clamped))
+    S.vmula(inverse, inverse, S.vmuls(residual_inv, inv_quant_max))
+    return scale, inverse
+
+
+@T.macro
+def get_sf_and_inv_asc(amax, out_config: CastOutputConfig):
+    quant_max = 6.0 if out_config.dtype == T.float4_e2m1fn else 448.0
+    clamped = S.vmaxs(amax, out_config.clamp_min_value)
+    if not out_config.round_sf:
+        return _sf_fast_div_asc(clamped, S.vdup(quant_max, T.float32), quant_max)
+    # exponent_offset = exponent_carry - scale offset
+    exponent_offset = T.uint32(0xFC1FFFFF if quant_max == 448.0 else 0xFF3FFFFF)
+    bits = T.reinterpret(clamped, 'uint32x64')
+    scale_out = S.vand(S.vadds(bits, exponent_offset), S.vdup(0x7F800000, T.uint32))
+    inverse = T.reinterpret(S.vsub(S.vdup(254 << 23, T.uint32), scale_out), 'float32x64')
+    if out_config.use_packed_ue8m0:
+        return S.vshrs(scale_out, 23), inverse
+    return T.reinterpret(scale_out, 'float32x64'), inverse
 
 
 @T.macro

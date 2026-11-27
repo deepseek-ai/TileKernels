@@ -1,10 +1,42 @@
 import math
 
 import torch
+from tilelang import language as T
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.config import get_max_ub_per_vector_core, get_num_vec_cores, get_pdl, is_ascend
 from tile_kernels.mhc.multilayer_recompute_cuda import mhc_multilayer_recompute_cuda
 from tile_kernels.utils import align
+
+
+# Mixes (pre/post/comb) stay fp32 in the Ascend kernel; reserve room for them plus
+# buffer-alignment slack when sizing the activation tiles.
+_ASC_MIX_SLACK_BYTES = 8 * 1024
+
+
+def _asc_h_blk(hidden: int, mhc_mult: int, x_dtype: torch.dtype) -> int:
+    """Hidden tile for the Ascend multilayer recompute kernel.
+
+    bf16 keeps the historical single-tile choice. fp32 doubles the activation
+    footprint, so cap h_blk by the UB budget and split hidden into tiles when
+    needed (the kernel already loops over ``num_hidden_tiles``).
+    """
+    from tile_kernels.mhc.common_asc import _H_BLK_ALIGN
+
+    if x_dtype == torch.bfloat16:
+        return min(align(hidden, _H_BLK_ALIGN), 8192)
+    assert x_dtype == torch.float32, f'unsupported dtype {x_dtype}'
+    mhc_pad = align(mhc_mult, 8)
+    mix_bytes = (2 * mhc_pad + 2 * mhc_pad + 2 * mhc_mult * mhc_mult) * T.float32.bytes
+    budget = get_max_ub_per_vector_core(use_simt=False) - mix_bytes - _ASC_MIX_SLACK_BYTES
+    bytes_per_hidden = (2 * mhc_mult + 4) * x_dtype.itemsize
+    h_blk = (budget // bytes_per_hidden) // _H_BLK_ALIGN * _H_BLK_ALIGN
+    assert h_blk >= _H_BLK_ALIGN, f'hidden tile does not fit UB (h_blk={h_blk}, hidden={hidden})'
+    if hidden <= h_blk:
+        return align(hidden, _H_BLK_ALIGN)
+    for tile in range(h_blk, _H_BLK_ALIGN - 1, -_H_BLK_ALIGN):
+        if hidden % tile == 0:
+            return tile
+    return h_blk
 
 
 def _make_ptr_tables_batched(
@@ -69,8 +101,7 @@ def mhc_multilayer_recompute(
     if is_ascend():
         from tile_kernels.mhc.multilayer_recompute_asc import mhc_multilayer_recompute_asc
 
-        h_blk = align(hidden, 64)
-        h_blk = min(h_blk, 8192)
+        h_blk = _asc_h_blk(hidden, mhc_mult, initial_residual.dtype)
         mhc_multilayer_recompute_asc(
             initial_residual.view(-1, mhc_mult, hidden),
             pre_mix_ptrs,
@@ -81,6 +112,7 @@ def mhc_multilayer_recompute(
             residual_ptrs,
             h_blk=h_blk,
             num_vec_cores=get_num_vec_cores(),
+            x_dtype=T.dtype(initial_residual.dtype),
         )
     else:
         h_blk = math.gcd(512, hidden)
@@ -94,5 +126,6 @@ def mhc_multilayer_recompute(
             residual_ptrs,
             n_thr=64,
             h_blk=h_blk,
+            x_dtype=T.dtype(initial_residual.dtype),
             use_pdl=get_pdl(),
         )

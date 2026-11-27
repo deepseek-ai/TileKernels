@@ -1,7 +1,7 @@
 import torch
 from typing import Optional
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.config import get_num_vec_cores, is_ascend
 from tile_kernels.quant.common import *
 from tile_kernels.quant.per_token_cast_cuda import get_per_token_cast_kernel_cuda
 
@@ -25,11 +25,13 @@ def per_token_cast_impl(
     assert fmt in ('e4m3', 'e2m1')
 
     x, x_sf, in_config = get_cast_input_and_config(x, x_block_size)
+    assert num_per_channels in (16, 32), 'num_per_channels must be 16 or 32'
+    assert x_block_size in (None, (32, 32))
     out_config = get_cast_output_config(fmt, (1, num_per_channels), use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, use_e4m3_sf)
 
     num_tokens, hidden = x.shape
     hidden = get_logical_hidden(hidden, x.dtype)
-    assert num_per_channels in (16, 32, 64, 128) and hidden % 64 == 0
+    assert hidden % 64 == 0
     assert not use_e4m3_sf or not is_ascend(), 'E4M3 SF is only supported on CUDA'
     assert sf is None or out_sf is None
     assert sf is None or (not use_tma_aligned_col_major_sf and not use_packed_ue8m0), 'Cast-only mode only supports row-major, non-packed SF'
@@ -45,6 +47,7 @@ def per_token_cast_impl(
             out_config=out_config,
             sf_only=sf_only,
             cast_only=(sf is not None),
+            small_batch=(stochastic_cast and num_tokens <= SMALL_BATCH_THRESHOLD),
             stochastic_cast=stochastic_cast,
             num_vec_cores=get_num_vec_cores(),
         )
@@ -58,8 +61,8 @@ def per_token_cast_impl(
             cast_only=(sf is not None),
             small_batch=num_tokens <= SMALL_BATCH_THRESHOLD,
             stochastic_cast=stochastic_cast,
-            use_pdl=get_pdl(),
-        )
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     # Allocate output and launch
     if out_x is None:

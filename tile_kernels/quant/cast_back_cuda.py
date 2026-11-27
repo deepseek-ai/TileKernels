@@ -40,6 +40,16 @@ def get_cast_back_kernel_cuda(
         # Per block cast case: 128 * 64
         TILE_M, TILE_K = 128, 64
 
+    num_vectorize = math.gcd(TILE_M * TILE_K // num_threads, get_best_vectorize_size(out_dtype))
+    # Keep row and column mappings separable for TileLang's layout inversion.
+    num_threads_per_row = math.gcd(num_threads, TILE_K // num_vectorize)
+    num_rows = num_threads // num_threads_per_row
+
+    def out_layout_fn(i, j):
+        thread = i % num_rows * num_threads_per_row + j // num_vectorize % num_threads_per_row
+        index = i // num_rows * (TILE_K // num_threads_per_row) + j // (num_threads_per_row * num_vectorize) * num_vectorize + j % num_vectorize
+        return thread, index
+
     sf_size = T.ceildiv(TILE_M, num_per_tokens) * T.ceildiv(TILE_K, num_per_channels)
     sf_size_aligned = align(sf_size, num_threads)
     num_blocks_per_token = T.ceildiv(hidden, TILE_K)
@@ -65,6 +75,9 @@ def get_cast_back_kernel_cuda(
             x_shared = T.alloc_shared((TILE_M, TILE_K), in_config.dtype)
             sf_shared = T.alloc_shared((T.ceildiv(TILE_M, num_per_tokens), T.ceildiv(TILE_K, num_per_channels)), T.float32)
             out_fragment = T.alloc_fragment((TILE_M, TILE_K), out_dtype)
+
+            if num_per_channels > 1:
+                T.annotate_layout({out_fragment: T.Fragment((TILE_M, TILE_K), forward_fn=out_layout_fn)})
 
             T.copy(x[pid_token * TILE_M, pid_hidden * TILE_K], x_shared, disable_tma=True)
             for id in T.Parallel(sf_size_aligned):

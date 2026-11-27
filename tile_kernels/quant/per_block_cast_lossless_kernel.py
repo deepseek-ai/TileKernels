@@ -28,13 +28,14 @@ def per_block_cast_lossless(
     Returns:
         A tuple ``(out, out_sf)`` with FP8 output and sf-factor tensor.
     """
+    assert x_block_size == (1, 32) and out_block_size == (32, 32), 'Lossless cast only supports in (1, 32) / out (32, 32)'
     x, x_sf, in_config = get_cast_input_and_config(x, x_block_size)
 
     assert fmt == 'e4m3' and x.dtype == torch.int8, 'lossless cast only supports e2m1 -> e4m3 input'
     assert x.is_contiguous() and x.dim() == 2
     num_tokens, hidden = x.shape
     hidden = get_logical_hidden(hidden, x.dtype)
-    assert num_tokens % 128 == 0, f'lossless cast requires num_tokens % 128 == 0, got {num_tokens}'
+    assert num_tokens % 32 == 0, f'lossless cast requires num_tokens % 32 == 0, got {num_tokens}'
     assert hidden % 128 == 0
 
     out_config = get_cast_output_config(fmt, out_block_size, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0)
@@ -42,7 +43,6 @@ def per_block_cast_lossless(
     if x.device.type == 'npu':
         from tile_kernels.quant.per_block_cast_lossless_asc import get_per_block_cast_lossless_kernel_asc
 
-        assert x_block_size == (1, 32) and out_block_size == (32, 32), 'ascend lossless only supports in (1, 32) / out (32, 32)'
         # FP4 is stored as packed int8; reinterpret as the 2x-packed fp4 dtype the kernel expects.
         x = x.view(torch.float4_e2m1fn_x2)
         kernel = get_per_block_cast_lossless_kernel_asc(

@@ -2,6 +2,7 @@ from .expand_kernel import expand_to_mhc_bwd, expand_to_mhc_fwd
 from .head_compute_mix_kernel import mhc_head_compute_mix_bwd, mhc_head_compute_mix_fwd
 from .multilayer_recompute_kernel import mhc_multilayer_recompute
 from .norm_fn_kernel import (
+    default_n_splits,
     mhc_fn_normw_merge_bwd,
     mhc_fn_normw_merge_fwd,
     mhc_reduce_partials_and_rmsnorm_bwd,

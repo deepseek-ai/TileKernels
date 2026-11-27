@@ -4,7 +4,6 @@ import torch
 
 
 import tile_kernels
-from tile_kernels.config import is_ascend
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.testing.generator import generate_cast_config, generate_hidden_sizes, generate_num_tokens, generate_rand_float, get_test_level
 from tile_kernels.testing.bench import make_param_id
@@ -59,10 +58,7 @@ def generate_test_data(params):
 
 
 def generate_test_params(level: int) -> list[dict]:
-    # Ascend only supports out block (32, 32) and hidden % 256 == 0 (all sf layouts supported).
-    ascend = is_ascend()
-    out_sf_blocks = ((32, 32),) if ascend else ((1, 128), (32, 32), (128, 128))
-    hidden_sizes = (*generate_hidden_sizes(256), 2304) if ascend else generate_hidden_sizes(128)
+    hidden_sizes = generate_hidden_sizes(level, ['main', 'ffn'], align=128)
     params = [
         {
             'num_tokens': num_tokens,
@@ -73,10 +69,10 @@ def generate_test_params(level: int) -> list[dict]:
             'out_use_tma_aligned_col_major_sf': out_use_tma_aligned_col_major_sf,
             'out_round_sf': out_round_sf,
             'out_use_packed_ue8m0': out_use_packed_ue8m0,
-            'out_sf_block': (out_sf_block_m, out_sf_block_k),
+            'out_sf_block': (32, 32),
             'in_sf_block': (in_sf_block_m, in_sf_block_k),
         }
-        for num_tokens in generate_num_tokens(level, 128)
+        for num_tokens in generate_num_tokens(level, 32)
         for hidden_size in hidden_sizes
         for in_use_tma_aligned_col_major_sf, in_round_sf, in_use_packed_ue8m0 in (
             [(False, True, False)] if level == 0 else generate_cast_config(level, 'e4m3')
@@ -86,7 +82,6 @@ def generate_test_params(level: int) -> list[dict]:
             [(False, True, False)] if level == 0 else generate_cast_config(level, 'e4m3')
         )
         if out_round_sf == True
-        for out_sf_block_m, out_sf_block_k in out_sf_blocks
         for in_sf_block_m, in_sf_block_k in ((1, 32),)
     ]
     return params

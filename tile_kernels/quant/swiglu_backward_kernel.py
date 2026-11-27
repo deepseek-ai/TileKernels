@@ -31,8 +31,7 @@ def swiglu_backward_and_per_token_cast_impl(
             For BF16 path: a plain BF16 tensor of shape (num_expanded_tokens, hidden * 2).
         act_x_grad: BF16 or FP32 gradient of shape (num_expanded_tokens, hidden).
         fmt: Target format (``'e4m3'``, ``'bf16'`` or ``'fp32'``).
-        num_per_channels: Number of channels in each scaling block. Ascend requires
-            32; CUDA supports 32 and 128. Required for FP8 path; ignored for BF16 path.
+        num_per_channels: Number of channels in each scaling block. Must be 32. Required for FP8 path; ignored for BF16 path.
         psum_num_tokens_per_expert: Optional prefix-sum of per-expert token counts,
             shape (num_experts,) int32.
         topk_weights: Optional routing weights of shape (num_expanded_tokens,) fp32.
@@ -55,10 +54,7 @@ def swiglu_backward_and_per_token_cast_impl(
     assert fmt in ('e4m3', 'bf16', 'fp32')
 
     if fmt == 'e4m3':
-        if is_ascend():
-            assert num_per_channels == 32, 'Ascend SwiGLU backward only supports num_per_channels=32'
-        else:
-            assert num_per_channels in (32, 128)
+        assert num_per_channels == 32, 'SwiGLU backward requires num_per_channels=32'
         x, x_sf = x
         assert x.dtype == torch.float8_e4m3fn
         assert x_sf.dim() == 2 and x_sf.is_contiguous()
@@ -208,8 +204,7 @@ def swiglu_backward_and_per_token_cast(
             Note: when ``psum_num_tokens_per_expert`` is provided, padding slots
             must be 0.
         fmt: Target output format (``'e4m3'``).
-        num_per_channels: Number of channels in each scaling block. Ascend requires
-            32; CUDA supports 32 and 128.
+        num_per_channels: Number of channels in each scaling block. Must be 32.
         topk_weights: Optional routing weights of shape (num_expanded_tokens,) fp32.
             When None, no per-row weight scaling is applied and weight_grad is
             not produced.

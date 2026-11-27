@@ -3,13 +3,14 @@ import os
 import pytest
 import torch
 
-from tile_kernels.config import get_device
+from tile_kernels.config import get_device, is_ascend
 from tile_kernels.engram import engram_gate_bwd
 from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
 from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_tokens, get_test_level
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.torch.engram import engram_gate_ref
+from tile_kernels.utils import str_to_dtype
 
 # Disable TileLang prints
 os.environ['TILELANG_PRINT_ON_COMPILATION'] = '0'
@@ -19,43 +20,60 @@ def generate_test_data(params):
     num_tokens = params['num_tokens']
     hc_mult = params['hc']
     hidden_size = params['hidden']
+    dtype = str_to_dtype(params['dtype'])
+    wv_dtype = str_to_dtype(params['wv_dtype'])
     eps = 1e-20
     clamp_value = 1e-6
     device = get_device()
-    x_data = randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    x_data = randn(num_tokens, hc_mult, hidden_size, dtype=dtype, device=device)
     kv_data = randn(num_tokens, hc_mult + 1, hidden_size, dtype=torch.bfloat16, device=device)
     wh_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     we_data = randn(hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
     weight_fused = wh_data.float() * we_data.float()
-    grad_out = randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=device)
+    weight_value = randn(hidden_size, dtype=wv_dtype, device=device) if params['has_value_norm'] else None
+    grad_out = randn(num_tokens, hc_mult, hidden_size, dtype=dtype, device=device)
     image_token_mask = torch.arange(num_tokens, device=device) % 5 < 2 if params['with_mask'] else None
-    return (x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, image_token_mask)
+    return (x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, image_token_mask, weight_value)
 
 
 def generate_test_params(level: int, mask_options: tuple[bool, ...] = (False, True)) -> list[dict]:
     return [
-        {'num_tokens': t, 'hc': hc, 'hidden': hidden_size, 'with_mask': with_mask}
+        {
+            'num_tokens': t,
+            'hc': hc,
+            'hidden': hidden_size,
+            'with_mask': with_mask,
+            'dtype': dtype,
+            'wv_dtype': wv_dtype,
+            'has_value_norm': has_value_norm,
+        }
         for t in generate_num_tokens(level)
         for hc in (4,)
-        for hidden_size in generate_hidden_sizes(256)
+        for hidden_size in generate_hidden_sizes(level, ['main'], align=128)
         for with_mask in mask_options
+        for dtype in ['bf16', 'fp32']
+        for has_value_norm in [False, True]
+        for wv_dtype in (['bf16', 'fp32'] if has_value_norm else ['bf16'])
     ]
 
 
-@pytest.mark.parametrize('params', generate_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_gate_bwd(params):
-    x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, image_token_mask = generate_test_data(params)
+    hc_mult = params['hc']
+    x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, image_token_mask, weight_value = generate_test_data(params)
     # Reference: forward with intermediates + autograd backward
     x_ref = x_data.clone().requires_grad_(True)
     kv_ref = kv_data.clone().requires_grad_(True)
     # Cast to float32 so autograd produces fp32 gradients matching the kernel
     wh_ref = wh_data.float().requires_grad_(True)
     we_ref = we_data.float().requires_grad_(True)
-    o_ref, dot_ref, gate_score_ref, rstd_x_ref, rstd_k_ref = engram_gate_ref(
+    wv_ref = weight_value.float().requires_grad_(True) if weight_value is not None else None
+    o_ref, dot_ref, gate_score_ref, rstd_x_ref, rstd_kv_ref = engram_gate_ref(
         x_ref,
         kv_ref,
         wh_ref,
         we_ref,
+        wv_ref,
         clamp_value,
         eps,
         save_for_backward=True,
@@ -69,38 +87,42 @@ def test_engram_gate_bwd(params):
         x_data,
         kv_data,
         weight_fused,
+        weight_value,
         dot_ref,
         gate_score_ref,
         rstd_x_ref,
-        rstd_k_ref,
+        rstd_kv_ref,
         clamp_value,
         image_token_mask=image_token_mask,
     )
     grad_w_fused = grad_w_partial.sum(0)
-    grad_wh = grad_w_fused * we_data.float()
-    grad_we = grad_w_fused * wh_data.float()
+    grad_wh = grad_w_fused[:hc_mult] * we_data.float()
+    grad_we = grad_w_fused[:hc_mult] * wh_data.float()
 
     # Correctness
     torch.testing.assert_close(grad_x, x_ref.grad, rtol=8e-3, atol=8e-3)
-    torch.testing.assert_close(grad_kv, kv_ref.grad, rtol=7e-3, atol=7e-3)
-    torch.testing.assert_close(grad_wh, wh_ref.grad, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(grad_we, we_ref.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(grad_kv, kv_ref.grad)
+    torch.testing.assert_close(grad_wh, wh_ref.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(grad_we, we_ref.grad, rtol=1e-4, atol=1e-4)
+    if weight_value is not None:
+        torch.testing.assert_close(grad_w_fused[hc_mult], wv_ref.grad, rtol=7e-5, atol=7e-5)
     if image_token_mask is not None:
         assert_equal(grad_x[image_token_mask], grad_out[image_token_mask])
         assert_equal(grad_kv[image_token_mask], torch.zeros_like(grad_kv[image_token_mask]))
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_test_params(0, mask_options=(False,)), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_test_params(1, mask_options=(False,)), ids=make_param_id)
 def test_engram_gate_bwd_benchmark(benchmark_timer, benchmark_record, params):
-    (x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, _) = generate_test_data(params)
+    (x_data, kv_data, wh_data, we_data, weight_fused, grad_out, eps, clamp_value, _, weight_value) = generate_test_data(params)
 
     # Forward to get intermediates
-    o_ref, dot_ref, gate_score_ref, rstd_x_ref, rstd_k_ref = engram_gate_ref(
+    o_ref, dot_ref, gate_score_ref, rstd_x_ref, rstd_kv_ref = engram_gate_ref(
         x_data,
         kv_data,
         wh_data,
         we_data,
+        weight_value,
         clamp_value,
         eps,
         save_for_backward=True,
@@ -111,10 +133,11 @@ def test_engram_gate_bwd_benchmark(benchmark_timer, benchmark_record, params):
         x_data,
         kv_data,
         weight_fused,
+        weight_value,
         dot_ref,
         gate_score_ref,
         rstd_x_ref,
-        rstd_k_ref,
+        rstd_kv_ref,
         clamp_value,
     )
 
@@ -123,10 +146,11 @@ def test_engram_gate_bwd_benchmark(benchmark_timer, benchmark_record, params):
         x_data,
         kv_data,
         weight_fused,
+        weight_value,
         dot_ref,
         gate_score_ref,
         rstd_x_ref,
-        rstd_k_ref,
+        rstd_kv_ref,
         clamp_value,
     )
     t_us = benchmark_timer(func_bwd)
@@ -135,10 +159,11 @@ def test_engram_gate_bwd_benchmark(benchmark_timer, benchmark_record, params):
         x_data,
         kv_data,
         weight_fused,
+        weight_value,
         dot_ref,
         gate_score_ref,
         rstd_x_ref,
-        rstd_k_ref,
+        rstd_kv_ref,
         grad_x,
         grad_kv,
         grad_w_partial,

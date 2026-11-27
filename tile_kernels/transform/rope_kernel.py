@@ -1,7 +1,7 @@
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_pdl, is_ascend
+from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
 
 from tile_kernels.transform.rope_cuda import get_rope_kernel_cuda
 
@@ -94,6 +94,7 @@ def apply_rotary(
                 cos_sin_cache.stride(0),
                 x.stride(1),
                 x.stride(2),
+                num_vec_cores=get_num_vec_cores(),
             )
         else:
             batch_is_one = x.shape[0] == 1

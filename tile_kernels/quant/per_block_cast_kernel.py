@@ -27,10 +27,11 @@ def per_block_cast_impl(
         Scale-factor tensor when ``sf_only=True``, casted tensor when ``sf``
         is provided, or a tuple ``(out, out_sf)`` with quantized output and sf factors.
     """
+    assert block_size == (32, 32), 'Per-block cast requires token block 32'
     assert x.is_contiguous() and x.dim() == 2
     num_tokens, hidden = x.shape
 
-    assert num_tokens % 128 == 0
+    assert num_tokens % 32 == 0
     assert hidden % 128 == 0
     assert sf is None or out_sf is None
     if sf is not None:

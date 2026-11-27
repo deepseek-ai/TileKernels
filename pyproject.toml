@@ -26,6 +26,7 @@ authors = [
     { name = "Yi Qian", email = "qianyi@deepseek.com" },
     { name = "Shengyuan Jia", email = "jia_shengyuan@deepseek.com" },
     { name = "Chenggang Zhao", email = "chenggangz@deepseek.com" },
+    { name = "Chaofan Lin", email = "chaofan@deepseek.com" },
     { name = "Wei Zhang", email = "recker@deepseek.com" },
     { name = "Lei Wang", email = "lei@deepseek.com" }
 ]
@@ -70,7 +71,7 @@ inline-quotes = "single"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--strict-markers"]
+addopts = ["--strict-markers", "--tb=short", "--show-capture=no"]
 filterwarnings = [
     # torch internal deprecation, unrelated to our code
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",

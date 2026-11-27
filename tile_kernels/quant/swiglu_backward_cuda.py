@@ -4,14 +4,8 @@ import tilelang
 from tilelang import language as T
 
 from tile_kernels.quant.common import *
+from tile_kernels.quant.templates_cuda import PREFETCH_L2_SOURCE, SYMMETRIC_CLAMP_SOURCE, UPPER_CLAMP_SOURCE
 from tile_kernels.utils import align
-
-PREFETCH_SOURCE = """
-__device__ __forceinline__ int tk_prefetch_l2(const void* addr) {
-    asm volatile("prefetch.global.L2 [%0];" : : "l"(__cvta_generic_to_global(addr)) : "memory");
-    return 0;
-}
-"""
 
 
 @tilelang.jit(
@@ -78,8 +72,8 @@ def get_swiglu_backward_and_per_token_cast_kernel_cuda(
         clamp_value: T.float32,
     ):
         with T.Kernel(num_blocks, threads=num_threads) as (pid_token,):
-            if use_prefetch:
-                T.import_source(PREFETCH_SOURCE)
+            if use_prefetch or use_clamp:
+                T.import_source(PREFETCH_L2_SOURCE + SYMMETRIC_CLAMP_SOURCE + UPPER_CLAMP_SOURCE)
             # Reduce register usage to 56 per thread.
             T.annotate_min_blocks_per_sm(18)
             if use_pdl:
@@ -192,11 +186,11 @@ def get_swiglu_backward_and_per_token_cast_kernel_cuda(
                             y_fp32 = T.cast(y_fragment[i], T.float32)
 
                         is_clamped_x = x_fp32 > clamp_value if use_clamp else False
-                        is_clamped_y = ((y_fp32 > clamp_value) or (y_fp32 < -clamp_value)) if use_clamp else False
+                        is_clamped_y = (T.abs(y_fp32) > clamp_value) if use_clamp else False
 
                         if use_clamp:
-                            x_fp32 = T.min(x_fp32, clamp_value)
-                            y_fp32 = T.max(T.min(y_fp32, clamp_value), -clamp_value)
+                            x_fp32 = T.call_extern(T.float32, 'tk_upper_clamp', x_fp32, clamp_value)
+                            y_fp32 = T.call_extern(T.float32, 'tk_symmetric_clamp', y_fp32, clamp_value)
 
                         act_x_grad_fp32 = T.cast(act_x_grad_fragment[i], T.float32)
                         tmp_fp32 = 1 + T.exp(-x_fp32)

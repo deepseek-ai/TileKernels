@@ -16,7 +16,7 @@ def generate_sinkhorn_test_data(n0: int, n1: int, mhc: int, device: str | None =
     return {
         'comb_res_mix': comb_res_mix,
         'out_grad': out_grad,
-        'repeat': 10,
+        'repeat': 20,
         'eps': 1e-6,
     }
 
@@ -86,7 +86,7 @@ def test_sinkhorn_large_same_sign_logits(offset: float, eps: float) -> None:
         dtype=torch.float32,
         device=device,
     ).view(1, 1, 4, 4)
-    repeat = 10
+    repeat = 20
 
     out_tl = _run_sinkhorn_fwd(comb_res_mix, repeat, eps)
     grad_tl = _run_sinkhorn_bwd(out_grad, comb_res_mix, repeat, eps)

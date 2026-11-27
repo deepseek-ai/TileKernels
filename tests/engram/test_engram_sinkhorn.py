@@ -12,7 +12,7 @@ from tile_kernels.engram import (
 )
 from tile_kernels.rand import randn
 from tile_kernels.testing.bench import make_param_id
-from tile_kernels.testing.generator import generate_num_sms, get_test_level
+from tile_kernels.testing.generator import generate_hidden_sizes, generate_num_sms, get_test_level
 from tile_kernels.testing.numeric import assert_equal, count_bytes
 from tile_kernels.torch.engram import (
     engram_sinkhorn_finalize_ref,
@@ -39,7 +39,7 @@ def generate_momentum_test_data(params):
 
 
 def generate_momentum_test_params(level: int) -> list[dict]:
-    sizes = [1001 * 256, 10001 * 256, 100001 * 512, 1000001 * 512]
+    sizes = [1001 * 128, 1001 * 256, 10001 * 256, 100001 * 512, 1000001 * 512]
     grad_dtypes = ('fp32',) if level == 0 else ('bf16', 'fp32')
     return [
         {'numel': numel, 'grad_dtype': grad_dtype, 'momentum_dtype': momentum_dtype, 'nesterov': nesterov, 'beta1': beta1}
@@ -51,7 +51,7 @@ def generate_momentum_test_params(level: int) -> list[dict]:
     ]
 
 
-@pytest.mark.parametrize('params', generate_momentum_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_momentum_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_sinkhorn_momentum_update(params):
     grad, momentum_buffer, beta1, nesterov = generate_momentum_test_data(params)
     momentum_buffer_ref = momentum_buffer.clone()
@@ -95,7 +95,10 @@ def generate_row_step_test_data(params):
 
 def generate_row_step_test_params(level: int) -> list[dict]:
     return [
-        {'num_rows': num_rows, 'head_dim': head_dim, 'eps': eps} for num_rows in [1001, 10001, 100001] for head_dim in [256, 5120] for eps in (1e-20,)
+        {'num_rows': num_rows, 'head_dim': head_dim, 'eps': eps}
+        for num_rows in [1001, 10001, 100001]
+        for head_dim in generate_hidden_sizes(level, ['engram_head', 'main'], align=128)
+        for eps in (1e-20,)
     ]
 
 
@@ -108,10 +111,14 @@ def generate_step_reduce_test_data(params):
 
 def generate_step_reduce_test_params(level: int) -> list[dict]:
     partials_per_sm = 2 if is_ascend() else 3
-    return [{'num_partials': num_sms * partials_per_sm, 'head_dim': head_dim} for num_sms in generate_num_sms(level) for head_dim in [256, 5120]]
+    return [
+        {'num_partials': num_sms * partials_per_sm, 'head_dim': head_dim}
+        for num_sms in generate_num_sms(level)
+        for head_dim in generate_hidden_sizes(level, ['engram_head', 'main'], align=128)
+    ]
 
 
-@pytest.mark.parametrize('params', generate_row_step_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_row_step_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_sinkhorn_step(params):
     matrix, row_scale, col_scale, col_sumsq_ref, eps = generate_row_step_test_data(params)
     row_scale_ref = row_scale.clone()
@@ -125,17 +132,17 @@ def test_engram_sinkhorn_step(params):
     torch.testing.assert_close(col_sumsq, col_sumsq_ref)
 
 
-@pytest.mark.parametrize('params', generate_step_reduce_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_step_reduce_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_sinkhorn_step_reduce(params):
     col_sumsq_partial, col_sumsq = generate_step_reduce_test_data(params)
     col_sumsq_ref = col_sumsq_partial.sum(0)
 
     engram_sinkhorn_step_reduce(col_sumsq_partial, col_sumsq)
 
-    torch.testing.assert_close(col_sumsq, col_sumsq_ref)
+    torch.testing.assert_close(col_sumsq, col_sumsq_ref, rtol=3e-6, atol=3e-6)
 
 
-@pytest.mark.parametrize('params', generate_row_step_test_params(get_test_level()), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_row_step_test_params(max(get_test_level(), 1)), ids=make_param_id)
 def test_engram_sinkhorn_finalize(params):
     matrix, row_scale, col_scale, _, eps = generate_row_step_test_data(params)
     alpha = params['head_dim'] ** 0.5
@@ -147,7 +154,7 @@ def test_engram_sinkhorn_finalize(params):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_row_step_test_params(0), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_row_step_test_params(1), ids=make_param_id)
 def test_engram_sinkhorn_step_benchmark(benchmark_timer, benchmark_record, params):
     matrix, row_scale, col_scale, _, eps = generate_row_step_test_data(params)
 
@@ -166,7 +173,7 @@ def test_engram_sinkhorn_step_benchmark(benchmark_timer, benchmark_record, param
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_step_reduce_test_params(0), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_step_reduce_test_params(1), ids=make_param_id)
 def test_engram_sinkhorn_step_reduce_benchmark(benchmark_timer, benchmark_record, params):
     col_sumsq_partial, col_sumsq = generate_step_reduce_test_data(params)
     engram_sinkhorn_step_reduce(col_sumsq_partial, col_sumsq)
@@ -185,7 +192,7 @@ def test_engram_sinkhorn_step_reduce_benchmark(benchmark_timer, benchmark_record
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize('params', generate_row_step_test_params(0), ids=make_param_id)
+@pytest.mark.parametrize('params', generate_row_step_test_params(1), ids=make_param_id)
 def test_engram_sinkhorn_finalize_benchmark(benchmark_timer, benchmark_record, params):
     matrix, row_scale, col_scale, _, eps = generate_row_step_test_data(params)
     alpha = params['head_dim'] ** 0.5

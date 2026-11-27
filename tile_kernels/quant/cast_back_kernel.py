@@ -1,7 +1,7 @@
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
+from tile_kernels.config import get_num_vec_cores, is_ascend
 from tile_kernels.quant.common import *
 from tile_kernels.quant.cast_back_cuda import get_cast_back_kernel_cuda
 
@@ -23,6 +23,7 @@ def cast_back(
     Returns:
         Dequantized tensor in the requested format.
     """
+    assert x_block_size in ((1, 32), (1, 16), (32, 32), (32, 1))
     assert fmt in ('bf16', 'fp32')
     out_dtype = torch.bfloat16 if fmt == 'bf16' else torch.float32
 
@@ -55,7 +56,12 @@ def cast_back(
             num_vec_cores=get_num_vec_cores(),
         )
     else:
-        kernel = get_cast_back_kernel_cuda(hidden=hidden, in_config=in_config, out_dtype=T.dtype(out_dtype), use_pdl=get_pdl())
+        kernel = get_cast_back_kernel_cuda(
+            hidden=hidden,
+            in_config=in_config,
+            out_dtype=T.dtype(out_dtype),
+            use_pdl=False,
+        )  # PDL regression: >=2us slower, keep PDL off.
 
     out = torch.empty((num_tokens, hidden), dtype=out_dtype, device=x.device)
     if num_tokens > 0:

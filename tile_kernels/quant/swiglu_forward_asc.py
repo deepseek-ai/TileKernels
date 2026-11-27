@@ -4,7 +4,7 @@ import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
 
-from tile_kernels.quant.common import CastOutputConfig, get_packed_ue8m0_pack_factor, get_sf_shape
+from tile_kernels.quant.common import CastOutputConfig, get_packed_ue8m0_pack_factor, get_sf_and_inv_asc, get_sf_shape
 from tile_kernels.utils import align
 
 
@@ -53,16 +53,6 @@ def get_swiglu_forward_kernel_asc(
     pack_factor = get_packed_ue8m0_pack_factor()
 
     @T.macro
-    def get_scale_and_inverse(amax):
-        clamped_amax = S.vmaxs(amax, out_config.clamp_min_value)
-        scale_bits = T.reinterpret(S.vmuls(clamped_amax, 1.0 / 448.0), 'uint32x64')
-        exponent = S.vadds(S.vshrs(S.vsub(scale_bits, S.vdup(1, T.uint32)), 23), 1)
-        inverse = T.reinterpret(S.vshls(S.vsub(S.vdup(254, T.uint32), exponent), 23), 'float32x64')
-        if out_config.use_packed_ue8m0:
-            return exponent, inverse
-        return T.reinterpret(S.vshls(exponent, 23), 'float32x64'), inverse
-
-    @T.macro
     def init_transpose_indices(indices):
         # Precompute gather indices shared by every token group when converting the
         # dense token-major scale buffer to the packed col-major output layout.
@@ -85,7 +75,7 @@ def get_swiglu_forward_kernel_asc(
             src_u16 = T.Tensor((token_group, align(num_groups, 64) // pack_factor), T.uint16, src.data)
 
             if num_full_vectors > 0:
-                for output_vector in T.unroll(num_full_vectors, explicit=True):
+                for output_vector in T.serial(num_full_vectors):
                     group_base = output_vector * groups_per_vector
                     values = S.vgather2(src_u16[0, group_base], source_indices)
                     S.vsts(dst[group_base, 0], values, dist='NORM_B16', extent=128)
@@ -95,6 +85,23 @@ def get_swiglu_forward_kernel_asc(
                 tail_mask = S.pset(16, f'PAT_VL{num_tail_values}')
                 values = S.vgather2(src_u16[0, tail_group_base], source_indices, tail_mask)
                 S.vsts(dst[tail_group_base, 0], values, tail_mask, dist='NORM_B16', extent=num_tail_values)
+
+    @T.macro
+    def load_stripes(src, col):
+        # ret[i] = [src[col+i], src[col+i+4], ..., src[col+i+252]], i = 0, 1, 2, 3.
+        if in_dtype == T.bfloat16:
+            even, odd = S.vld2(src[col], dist='DINTLV_B16')
+            return (
+                S.vcvt(even, T.float32, part=0),
+                S.vcvt(odd, T.float32, part=0),
+                S.vcvt(even, T.float32, part=1),
+                S.vcvt(odd, T.float32, part=1),
+            )
+        even0, odd0 = S.vld2(src[col], dist='DINTLV_B32')
+        even1, odd1 = S.vld2(src[col + 128], dist='DINTLV_B32')
+        stripe0, stripe2 = S.vdintlv(even0, even1)
+        stripe1, stripe3 = S.vdintlv(odd0, odd1)
+        return stripe0, stripe1, stripe2, stripe3
 
     @T.macro
     def compute_swiglu(xl_ub, xr_ub, values_ub, out_ub, weight, precision, amax_ub, with_certificate, pacc_buf, count_clamp, acc=None):
@@ -108,24 +115,32 @@ def get_swiglu_forward_kernel_asc(
                     acc[i] = S.vdup(0, T.int32)
         if with_certificate:
             certificate_min = S.alloc_var(T.uint32)
-            certificate_max = S.alloc_var(T.uint32)
             certificate_min = S.vdup(0xFFFFFFFF, T.uint32)
-            certificate_max = S.vdup(0, T.uint32)
         else:
             certificate_min = None
-            certificate_max = None
         if out_config.with_sf:
             amax_store_mask = S.pset(32, 'PAT_VL8')
             amax_acc = S.alloc_local((4,), T.float32)
             for i in T.unroll(4, explicit=True):
                 amax_acc[i] = S.vdup(0.0, T.float32)
-
+            left = S.alloc_local((4,), T.float32)
+            right = S.alloc_local((4,), T.float32)
         for tile_id in T.serial(T.ceildiv(num_vecs, 4)):
+            if out_config.with_sf and hidden % 256 != 0:
+                # A 128-element tail occupies the first 32 lanes of each stripe.
+                valid_mask = S.vcmps(S.vci(0, T.int32), T.min(64, (hidden - tile_id * 256) // 4), op='lt')
+            else:
+                valid_mask = None
+            if out_config.with_sf:
+                left[0], left[1], left[2], left[3] = load_stripes(xl_ub, tile_id * 256)
+                right[0], right[1], right[2], right[3] = load_stripes(xr_ub, tile_id * 256)
             for sub in T.unroll(4, explicit=True):
                 vector_id = tile_id * 4 + sub
-                if vector_id < num_vecs:
+                if out_config.with_sf or vector_id < num_vecs:
                     col = vector_id * vec_size
-                    if in_dtype == T.bfloat16:
+                    if out_config.with_sf:
+                        val_l, val_r = left[sub], right[sub]
+                    elif in_dtype == T.bfloat16:
                         val_l = S.vcvt(S.vld(xl_ub[col], dist='UNPK_B16'), T.float32, part=0)
                         val_r = S.vcvt(S.vld(xr_ub[col], dist='UNPK_B16'), T.float32, part=0)
                     else:
@@ -150,32 +165,28 @@ def get_swiglu_forward_kernel_asc(
                         S.vsts(out_ub[col], out_val)
 
                     if with_certificate:
-                        # Keep the low 19 mantissa bits; values too close to either end of this window use the exact fallback.
-                        metric = S.vand(T.reinterpret(out_val, 'uint32x64'), S.vdup(0x7FFFF, T.uint32))
+                        # With M = 2**19 and e = certificate_error, unsafe means (bits & (M - 1)) is in [0, e] or [M - e, M - 1].
+                        # Equivalently, ((bits + e) & (M - 1)) is in [0, 2 * e], so only a min reduction is needed.
+                        metric = S.vand(S.vadds(T.reinterpret(out_val, 'uint32x64'), certificate_error), S.vdup(0x7FFFF, T.uint32))
+                        if hidden % 256 != 0:
+                            metric = S.vsel(metric, S.vdup(0x7FFFF, T.uint32), valid_mask)  # set invalid to max-value
                         certificate_min = S.vmin(certificate_min, metric)
-                        certificate_max = S.vmax(certificate_max, metric)
                     if count_clamp:
-                        clamped_mask_0 = S.vcmps(val_l, clamp_value, op='gt')
-                        clamped_mask_1 = S.vcmps(val_r, clamp_value, op='gt')
-                        clamped_mask_2 = S.vcmps(val_r, -clamp_value, op='lt')
+                        clamped_mask_0 = S.vcmps(val_l, clamp_value, valid_mask, op='gt')
+                        clamped_mask_1 = S.vcmps(val_r, clamp_value, valid_mask, op='gt')
+                        clamped_mask_2 = S.vcmps(val_r, -clamp_value, valid_mask, op='lt')
                         acc[0] = S.vadds(acc[0], 1, clamped_mask_0, mode='MODE_MERGING')
                         acc[1] = S.vadds(acc[1], 1, clamped_mask_1, mode='MODE_MERGING')
                         acc[2] = S.vadds(acc[2], 1, clamped_mask_2, mode='MODE_MERGING')
                     if out_config.with_sf:
                         amax_acc[sub] = S.vabs(out_val)
             if out_config.with_sf:
-                # 256-element tile amax reduction
-                low01, high01 = S.vdintlv(amax_acc[0], amax_acc[1])
-                low23, high23 = S.vdintlv(amax_acc[2], amax_acc[3])
-                compressed01 = S.vmax(low01, high01)
-                compressed23 = S.vmax(low23, high23)
-                low, high = S.vdintlv(compressed01, compressed23)
-                amax = S.vcgmax(S.vmax(low, high))
+                amax = S.vcgmax(S.vmax(S.vmax(amax_acc[0], amax_acc[1]), S.vmax(amax_acc[2], amax_acc[3])))
                 S.vsts(amax_ub[tile_id * 8], amax, amax_store_mask, dist='NORM_B32', extent=8)
         if count_clamp:
             for i in T.unroll(3, explicit=True):
                 S.vsts(pacc_buf[i, 0], S.vadd(S.vld(pacc_buf[i, 0]), acc[i]))
-        return certificate_min, certificate_max
+        return certificate_min
 
     @T.macro
     def quantize_f32(values_ub, amax_ub, inverse_ub, sf_dense_ub, out_ub, token_offset):
@@ -184,31 +195,26 @@ def get_swiglu_forward_kernel_asc(
             for group_batch in T.serial(T.ceildiv(num_groups, 64)):
                 group = group_batch * 64
                 amax = S.vld(amax_ub[group])
-                if out_config.round_sf:
-                    scales_or_exponents, inverses = get_scale_and_inverse(amax)
-                    if out_config.use_packed_ue8m0:
-                        S.vsts(sf_dense_ub[token_offset, group], T.reinterpret(scales_or_exponents, 'uint8x256'), dist='PK4_B32')
-                    else:
-                        S.vsts(sf_dense_ub[token_offset, group], scales_or_exponents)
-                    S.vsts(inverse_ub[group], inverses)
+                scales_or_exponents, inverses = get_sf_and_inv_asc(amax, out_config)
+                if out_config.use_packed_ue8m0:
+                    S.vsts(sf_dense_ub[token_offset, group], T.reinterpret(scales_or_exponents, 'uint8x256'), dist='PK4_B32')
                 else:
-                    clamped_amax = S.vmaxs(amax, out_config.clamp_min_value)
-                    quant_max = S.vdup(448.0, T.float32)
-                    S.vsts(sf_dense_ub[token_offset, group], S.vdiv(clamped_amax, quant_max))
-                    S.vsts(inverse_ub[group], S.vdiv(quant_max, clamped_amax))
+                    S.vsts(sf_dense_ub[token_offset, group], scales_or_exponents)
+                S.vsts(inverse_ub[group], inverses)
 
             S.mem_bar('VST_VLD')
-            group_lane = S.vshrs(S.vci(0, T.int32), 5)
-            for group_batch in T.unroll(T.ceildiv(num_groups, 64), explicit=True):
-                group_base = group_batch * 64
-                vector_base = group_batch * 32
-                inverses = S.vld(inverse_ub[group_base])
-                for vector in T.serial(T.min(32, num_vecs - vector_base)):
-                    col = (vector_base + vector) * vec_size
-                    inverse_indices = S.vadds(group_lane, vector * 2)
-                    expanded_inverse = S.vselr(inverses, inverse_indices)
-                    quantized = S.vcvt(S.vmul(S.vld(values_ub[col]), expanded_inverse), T.float8_e4m3fn)
-                    S.vsts(out_ub[col], quantized, dist='PK4_B32')
+            quantized = S.alloc_local((4,), T.float8_e4m3fn)
+            for chunk in T.serial(T.ceildiv(hidden, 256)):
+                packed = S.vld(inverse_ub[chunk * 8], dist='E2B_B32')
+                quantized[0] = S.vcvt(S.vmul(S.vld(values_ub[chunk * 256]), packed), T.float8_e4m3fn, part=0)
+                quantized[1] = S.vcvt(S.vmul(S.vld(values_ub[chunk * 256 + 64]), packed), T.float8_e4m3fn, part=1)
+                quantized[2] = S.vcvt(S.vmul(S.vld(values_ub[chunk * 256 + 128]), packed), T.float8_e4m3fn, part=2)
+                quantized[3] = S.vcvt(S.vmul(S.vld(values_ub[chunk * 256 + 192]), packed), T.float8_e4m3fn, part=3)
+                merged = S.vor(
+                    S.vor(T.reinterpret(quantized[0], 'uint8x256'), T.reinterpret(quantized[1], 'uint8x256')),
+                    S.vor(T.reinterpret(quantized[2], 'uint8x256'), T.reinterpret(quantized[3], 'uint8x256')),
+                )
+                S.vsts(out_ub[chunk * 256], T.reinterpret(merged, 'float8_e4m3fnx256'), dist='NORM_B8')
 
     @T.macro
     def load_weight(topk_weights, token_id, routed_scaling_factor):
@@ -293,7 +299,7 @@ def get_swiglu_forward_kernel_asc(
             if out_config.with_sf:
                 amax_ub = T.alloc_shared((align(num_groups, 64),), T.float32)
                 if use_fast_certificate:
-                    certificate_ub = T.alloc_shared((token_group, 2), T.uint32)
+                    certificate_ub = T.alloc_shared((token_group,), T.uint32)
                 inverse_ub = T.alloc_shared((align(num_groups, 64),), T.float32)
                 sf_dense_ub = T.alloc_shared(
                     (token_group, align(num_groups, 64)),
@@ -344,12 +350,11 @@ def get_swiglu_forward_kernel_asc(
                             weight = load_inputs(x, xl_ub, xr_ub, topk_weights, routed_scaling_factor, token_id)
                             with T.SimdVF():
                                 vdiv_precision = 'ftz_true' if use_fast_certificate else 'exact'
-                                cert_min, cert_max = compute_swiglu(
+                                cert_min = compute_swiglu(
                                     xl_ub, xr_ub, values_ub, out_ub, weight, vdiv_precision, amax_ub, use_fast_certificate, pacc_ub, count_clamp
                                 )
                                 if use_fast_certificate:
-                                    S.vsts(certificate_ub[token_offset, 0], S.vcmin(cert_min), dist='ONEPT_B32')
-                                    S.vsts(certificate_ub[token_offset, 1], S.vcmax(cert_max), dist='ONEPT_B32')
+                                    S.vsts(certificate_ub[token_offset], S.vcmin(cert_min), dist='ONEPT_B32')
                             finish_token(
                                 values_ub, out_ub, amax_ub, inverse_ub, sf_dense_ub, out, out_sf, token_offset, token_id, count_ub, count_clamp
                             )
@@ -358,18 +363,12 @@ def get_swiglu_forward_kernel_asc(
                         for fallback_offset in T.serial(token_group):
                             token_id = T.alloc_var(T.int32, init=token_base + fallback_offset)
                             valid = is_valid_token(token_id, expert_id if has_psum else 0, psum_ub if has_psum else None)
-                            unsafe = T.alloc_var(
-                                T.bool,
-                                init=(
-                                    certificate_ub[fallback_offset, 0] <= certificate_error
-                                    or certificate_ub[fallback_offset, 1] >= 0x80000 - certificate_error
-                                ),
-                            )
+                            unsafe = T.alloc_var(T.bool, init=certificate_ub[fallback_offset] <= 2 * certificate_error)
                             if valid and unsafe:
                                 weight = load_inputs(x, xl_fb_ub, xr_fb_ub, topk_weights, routed_scaling_factor, token_id)
                                 with T.SimdVF():
                                     # Clamp counts were already accumulated in the main path; fallback must set count_clamp to False
-                                    _, _ = compute_swiglu(xl_fb_ub, xr_fb_ub, values_fb_ub, out_fb_ub, weight, 'exact', amax_ub, False, None, False)
+                                    _ = compute_swiglu(xl_fb_ub, xr_fb_ub, values_fb_ub, out_fb_ub, weight, 'exact', amax_ub, False, None, False)
                                 finish_token(
                                     values_fb_ub, out_fb_ub, amax_ub, inverse_ub, sf_dense_ub, out, out_sf, fallback_offset, token_id, None, False
                                 )

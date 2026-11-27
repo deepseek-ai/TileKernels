@@ -6,39 +6,15 @@ from tile_kernels.mhc.multilayer_recompute_kernel import mhc_multilayer_recomput
 from tile_kernels.mhc.post_kernel import mhc_post_fwd
 from tile_kernels.mhc.pre_apply_mix_kernel import mhc_pre_apply_mix_fwd
 from tile_kernels.rand import randn
+from tile_kernels.testing.generator import generate_hidden_sizes, get_test_level
 
 _CORRECTNESS_CASES = [
-    (1, 1, 2560),
-    (3, 2, 2560),
-    (3, 3, 2560),
-    (10, 9, 2560),
-    (10, 10, 2560),
-    (10, 9, 4096),
-    (10, 10, 4096),
-    (10, 9, 5120),
-    (10, 10, 5120),
-    (10, 9, 7168),
-    (10, 10, 7168),
-    (10, 9, 8192),
-    (10, 10, 8192),
-    (10, 9, 1280),
-    (10, 10, 1280),
-    (10, 9, 2304),
-    (10, 10, 2304),
+    (num_layers, num_post, hidden)
+    for num_layers, num_post in [(1, 1), (3, 2), (3, 3), (10, 9), (10, 10)]
+    for hidden in generate_hidden_sizes(max(get_test_level(), 1), ['main'], align=128)
 ]
 
-_BENCH_CASES = [
-    (10, 9, 1, 8192, 4, 2560),
-    (10, 10, 1, 8192, 4, 2560),
-    (10, 9, 1, 8192, 4, 4096),
-    (10, 10, 1, 8192, 4, 4096),
-    (10, 9, 1, 8192, 4, 5120),
-    (10, 10, 1, 8192, 4, 5120),
-    (10, 9, 1, 8192, 4, 7168),
-    (10, 10, 1, 8192, 4, 7168),
-    (10, 9, 1, 8192, 4, 8192),
-    (10, 10, 1, 8192, 4, 8192),
-]
+_BENCH_CASES = [(10, num_post, 1, 8192, 4, h) for num_post in (9, 10) for h in generate_hidden_sizes(1, ['main'])]
 
 
 def generate_multilayer_recompute_test_data(
@@ -48,6 +24,7 @@ def generate_multilayer_recompute_test_data(
     hidden: int,
     num_layers: int,
     num_post: int,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[
     torch.Tensor,
     list[torch.Tensor],
@@ -58,13 +35,13 @@ def generate_multilayer_recompute_test_data(
     list[torch.Tensor],
 ]:
     device = get_device()
-    initial_residual = randn(bs, seq, mhc_mult, hidden, device=device, dtype=torch.bfloat16)
+    initial_residual = randn(bs, seq, mhc_mult, hidden, device=device, dtype=dtype)
     pre_mix_list = [randn(bs, seq, mhc_mult, 1, device=device, dtype=torch.float32) for _ in range(num_layers)]
-    layer_output_list = [randn(bs, seq, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_post)]
+    layer_output_list = [randn(bs, seq, hidden, device=device, dtype=dtype) for _ in range(num_post)]
     post_mix_list = [randn(bs, seq, mhc_mult, 1, device=device, dtype=torch.float32) for _ in range(num_post)]
     comb_mix_list = [randn(bs, seq, mhc_mult, mhc_mult, device=device, dtype=torch.float32) for _ in range(num_post)]
-    layer_input_list = [torch.empty(bs, seq, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_layers)]
-    residual_list = [torch.empty(bs, seq, mhc_mult, hidden, device=device, dtype=torch.bfloat16) for _ in range(num_post)]
+    layer_input_list = [torch.empty(bs, seq, hidden, device=device, dtype=dtype) for _ in range(num_layers)]
+    residual_list = [torch.empty(bs, seq, mhc_mult, hidden, device=device, dtype=dtype) for _ in range(num_post)]
     return initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list, layer_input_list, residual_list
 
 
@@ -82,7 +59,7 @@ def _mhc_multilayer_recompute_ref(
     hidden = initial_residual.shape[-1]
     num_tokens = initial_residual.numel() // (mhc_mult * hidden)
     for i in range(len(pre_mix_list)):
-        layer_input = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=residual.device)
+        layer_input = torch.empty(num_tokens, hidden, dtype=residual.dtype, device=residual.device)
         mhc_pre_apply_mix_fwd(
             residual.view(num_tokens, mhc_mult, hidden),
             pre_mix_list[i].view(num_tokens, mhc_mult),
@@ -96,23 +73,30 @@ def _mhc_multilayer_recompute_ref(
     return layer_input_refs, residual_refs
 
 
-def _compute_io_bytes(n: int, mhc_mult: int, hidden: int, num_layers: int, num_post: int) -> tuple[int, int]:
-    io_pre = n * mhc_mult * hidden * 2 + n * mhc_mult * 4 + n * hidden * 2
-    io_post = n * hidden * 2 + n * mhc_mult * hidden * 2 + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4 + n * mhc_mult * hidden * 2
+def _compute_io_bytes(n: int, mhc_mult: int, hidden: int, num_layers: int, num_post: int, element_size: int) -> tuple[int, int]:
+    io_pre = n * mhc_mult * hidden * element_size + n * mhc_mult * 4 + n * hidden * element_size
+    io_post = (
+        n * hidden * element_size
+        + n * mhc_mult * hidden * element_size
+        + n * mhc_mult * 4
+        + n * mhc_mult * mhc_mult * 4
+        + n * mhc_mult * hidden * element_size
+    )
     io_ref = num_layers * io_pre + num_post * io_post
     io_fused = (
-        n * mhc_mult * hidden * 2
-        + num_layers * (n * mhc_mult * 4 + n * hidden * 2)
-        + num_post * (n * hidden * 2 + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4 + n * mhc_mult * hidden * 2)
+        n * mhc_mult * hidden * element_size
+        + num_layers * (n * mhc_mult * 4 + n * hidden * element_size)
+        + num_post * (n * hidden * element_size + n * mhc_mult * 4 + n * mhc_mult * mhc_mult * 4 + n * mhc_mult * hidden * element_size)
     )
     return io_ref, io_fused
 
 
 @pytest.mark.parametrize('num_layers,num_post,hidden', _CORRECTNESS_CASES)
-def test_mhc_multilayer_recompute_correctness(num_layers: int, num_post: int, hidden: int) -> None:
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+def test_mhc_multilayer_recompute_correctness(num_layers: int, num_post: int, hidden: int, dtype: torch.dtype) -> None:
     torch.manual_seed(0)
     initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list, layer_input_list, residual_list = (
-        generate_multilayer_recompute_test_data(1, 8192, 4, hidden, num_layers, num_post)
+        generate_multilayer_recompute_test_data(1, 8192, 4, hidden, num_layers, num_post, dtype=dtype)
     )
     layer_input_ref, residual_ref = _mhc_multilayer_recompute_ref(initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list)
     mhc_multilayer_recompute(initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list, layer_input_list, residual_list)
@@ -129,6 +113,7 @@ def test_mhc_multilayer_recompute_correctness(num_layers: int, num_post: int, hi
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize('num_layers,num_post,bs,seq,mhc_mult,hidden', _BENCH_CASES)
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_mhc_multilayer_recompute_benchmark(
     num_layers: int,
     num_post: int,
@@ -136,16 +121,17 @@ def test_mhc_multilayer_recompute_benchmark(
     seq: int,
     mhc_mult: int,
     hidden: int,
+    dtype: torch.dtype,
     benchmark_record,
     benchmark_timer,
 ) -> None:
     torch.manual_seed(0)
     n = bs * seq
-    io_ref, io_fused = _compute_io_bytes(n, mhc_mult, hidden, num_layers, num_post)
-    theory = io_ref / io_fused
     initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list, layer_input_list, residual_list = (
-        generate_multilayer_recompute_test_data(bs, seq, mhc_mult, hidden, num_layers, num_post)
+        generate_multilayer_recompute_test_data(bs, seq, mhc_mult, hidden, num_layers, num_post, dtype=dtype)
     )
+    io_ref, io_fused = _compute_io_bytes(n, mhc_mult, hidden, num_layers, num_post, initial_residual.element_size())
+    theory = io_ref / io_fused
 
     def fn_ref() -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         return _mhc_multilayer_recompute_ref(initial_residual, pre_mix_list, layer_output_list, post_mix_list, comb_mix_list)
@@ -164,7 +150,7 @@ def test_mhc_multilayer_recompute_benchmark(
     benchmark_record(
         kernel='mhc_multilayer_recompute',
         operation='recompute',
-        params={'num_layers': num_layers, 'num_post': num_post, 'bs': bs, 'seq': seq, 'mhc_mult': mhc_mult, 'hidden': hidden},
+        params={'num_layers': num_layers, 'num_post': num_post, 'bs': bs, 'seq': seq, 'mhc_mult': mhc_mult, 'hidden': hidden, 'dtype': str(dtype)},
         time_us=t_fused_us,
         bandwidth_gbs=bw_fused_gbs,
         extras={

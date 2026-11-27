@@ -380,7 +380,6 @@ def mhc_pre_split_mixes_bwd_mhc4_asc(
                 ones = S.vdup(T.float32(1), T.float32, mask)
                 scale0 = S.vld(scale_ub[0, 0], 'BRC_B32')
                 scale1 = S.vld(scale_ub[1, 0], 'BRC_B32')
-                scale2 = S.vld(scale_ub[2, 0], 'BRC_B32')
                 post_mult = S.vdup(T.float32(mhc_post_mult_value), T.float32, mask)
                 pre_base_vec = S.alloc_var(T.float32)
                 post_base_vec = S.alloc_var(T.float32)
@@ -396,9 +395,9 @@ def mhc_pre_split_mixes_bwd_mhc4_asc(
                     base_mask = S.vcmps(col15, T.int32(base_id), mask, 'eq')
                     comb_base_vec = S.vsel(S.vld(base_ub[base_id + 8, 0], 'BRC_B32'), comb_base_vec, base_mask)
 
-                scale_acc = S.alloc_local((3,), T.float32)
-                base_acc = S.alloc_local((3,), T.float32)
-                for i in T.unroll(3, explicit=True):
+                scale_acc = S.alloc_local((2,), T.float32)
+                base_acc = S.alloc_local((2,), T.float32)
+                for i in T.unroll(2, explicit=True):
                     scale_acc[i] = S.vld(scale_grad_acc_ub[i, 0])
                     base_acc[i] = S.vld(base_grad_acc_ub[i, 0])
 
@@ -433,6 +432,20 @@ def mhc_pre_split_mixes_bwd_mhc4_asc(
                     scale_acc[1] = S.vadd(scale_acc[1], S.vmul(post_grad, post_inp, mask), mask)
                     base_acc[1] = S.vadd(base_acc[1], post_grad, mask)
 
+                for i in T.unroll(2, explicit=True):
+                    S.vsts(scale_grad_acc_ub[i, 0], scale_acc[i], mask)
+                    S.vsts(base_grad_acc_ub[i, 0], base_acc[i], mask)
+
+            with T.SimdVF():
+                mask = S.pset(32)
+                idx = S.vci(T.int32(0), T.int32)
+                col15 = S.vand(idx, S.vdup(T.int32(15), T.int32, mask), mask)
+                scale2 = S.vld(scale_ub[2, 0], 'BRC_B32')
+                comb_scale_sum = S.alloc_var(T.float32)
+                comb_base_sum = S.alloc_var(T.float32)
+                comb_scale_sum = S.vld(scale_grad_acc_ub[2, 0])
+                comb_base_sum = S.vld(base_grad_acc_ub[2, 0])
+                valid_tokens = T.min(token_block_size, num_tokens - t * token_block_size)
                 for vec_id in T.serial(16):
                     token = S.vadd(S.vshrs(idx, T.int32(4), mask), S.vdup(T.int32(vec_id * 4), T.int32, mask), mask)
                     token16 = S.vshls(token, T.int32(4), mask)
@@ -443,12 +456,11 @@ def mhc_pre_split_mixes_bwd_mhc4_asc(
                     comb_inp = S.vgather2(input_mixes_ub[0, 0], _u32_index(input_index), token_mask)
                     comb_grad = S.vgather2(comb_res_mix_grad_ub[0, 0], _u32_index(grad_index), token_mask)
                     S.vscatter(S.vmul(comb_grad, scale2, mask), input_mixes_grad_ub[0, 0], _u32_index(input_index), token_mask)
-                    scale_acc[2] = S.vadd(scale_acc[2], S.vmul(comb_grad, comb_inp, mask), mask)
-                    base_acc[2] = S.vadd(base_acc[2], comb_grad, mask)
+                    comb_scale_sum = S.vadd(comb_scale_sum, S.vmul(comb_grad, comb_inp, mask), mask)
+                    comb_base_sum = S.vadd(comb_base_sum, comb_grad, mask)
 
-                for i in T.unroll(3, explicit=True):
-                    S.vsts(scale_grad_acc_ub[i, 0], scale_acc[i], mask)
-                    S.vsts(base_grad_acc_ub[i, 0], base_acc[i], mask)
+                S.vsts(scale_grad_acc_ub[2, 0], comb_scale_sum, mask)
+                S.vsts(base_grad_acc_ub[2, 0], comb_base_sum, mask)
 
             T.copy(input_mixes_grad_ub, input_mixes_grad[t * token_block_size, 0])
 
@@ -467,7 +479,7 @@ def mhc_pre_split_mixes_bwd_mhc4_asc(
                 base_mask = S.vcmps(col3, T.int32(base_id), mask, 'eq')
                 S.vsts(base_grad_out_ub[base_id, 0], S.vcadd(pre_base_acc, base_mask), lane0, 'ONEPT_B32')
                 S.vsts(base_grad_out_ub[base_id + 4, 0], S.vcadd(post_base_acc, base_mask), lane0, 'ONEPT_B32')
-            for base_id in T.unroll(16, explicit=True):
+            for base_id in T.unroll(16, unroll_factor=1):
                 base_mask = S.vcmps(col15, T.int32(base_id), mask, 'eq')
                 S.vsts(base_grad_out_ub[base_id + 8, 0], S.vcadd(comb_base_acc, base_mask), lane0, 'ONEPT_B32')
 

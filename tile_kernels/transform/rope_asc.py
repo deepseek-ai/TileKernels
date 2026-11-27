@@ -4,7 +4,7 @@ import tilelang
 import tilelang.ascend.language as T
 from tilelang.ascend.language import simd as S
 
-from tile_kernels.config import get_max_ub_per_vector_core, get_num_vec_cores
+from tile_kernels.config import get_max_ub_per_vector_core
 
 SIMD_LANES = 64
 
@@ -21,13 +21,13 @@ def get_rope_kernel_asc(
     cos_sin_stride: int,
     x_stride_0: int,
     x_stride_1: int,
+    num_vec_cores: int,
 ) -> Any:
     assert dtype in (T.bfloat16, T.float32)
     assert positions_dtype in (T.int32, T.int64)
     assert rotary_dim in (64, 128)
 
     half_dim = rotary_dim // 2
-    num_vec_cores = get_num_vec_cores()
     dtype_size = dtype.bytes
     bytes_per_row = nheads * rotary_dim * dtype_size + rotary_dim * 4
     max_ub_size = get_max_ub_per_vector_core(use_simt=False)

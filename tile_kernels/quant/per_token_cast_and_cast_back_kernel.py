@@ -19,7 +19,7 @@ def per_token_cast_and_cast_back(
         x: Input 2D tensor of shape (num_tokens, hidden). The innermost stride must
             be 1; ``x.stride(0)`` may exceed ``hidden`` (non-contiguous rows allowed).
         fmt: Quantized format used for cast-and-cast-back (``'e4m3'`` or ``'e2m1'``).
-        num_per_channels: Number of channels in each scaling block (16, 32, 64 or 128).
+        num_per_channels: Number of channels in each scaling block (16 or 32).
             On Ascend, only 16 and 32 are supported; 16 requires use_e4m3_sf=True.
         round_sf: Whether to round scaling factors to powers of two.
         use_e4m3_sf: Whether to round the internal scale factors to E4M3.
@@ -28,7 +28,7 @@ def per_token_cast_and_cast_back(
     assert x.dim() == 2
     assert x.stride(1) == 1
     assert fmt in ('e4m3', 'e2m1')
-    assert num_per_channels in (16, 32, 64, 128)
+    assert num_per_channels in (16, 32), 'num_per_channels must be 16 or 32'
     assert not (round_sf and use_e4m3_sf)
 
     num_tokens, hidden = x.shape

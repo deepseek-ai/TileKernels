@@ -4,6 +4,7 @@ import torch
 from tile_kernels.config import get_device
 from tile_kernels.mhc.post_kernel import mhc_post_bwd, mhc_post_fwd
 from tile_kernels.rand import randn
+from tile_kernels.testing.generator import generate_hidden_sizes, get_test_level
 from tile_kernels.testing.numeric import count_bytes
 from tile_kernels.torch.mhc import mhc_post_ref
 
@@ -14,15 +15,16 @@ def generate_mhc_post_test_data(
     h: int,
     mhc_mult: int,
     device: str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor]:
     if device is None:
         device = get_device()
-    x = randn((n0, n1, h), dtype=torch.bfloat16, device=device)
-    residual = randn((n0, n1, mhc_mult, h), dtype=torch.bfloat16, device=device)
+    x = randn((n0, n1, h), dtype=dtype, device=device)
+    residual = randn((n0, n1, mhc_mult, h), dtype=dtype, device=device)
     post_layer_mix = randn((n0, n1, mhc_mult, 1), dtype=torch.float32, device=device)
     comb_res_mix = randn((n0, n1, mhc_mult, mhc_mult), dtype=torch.float32, device=device)
 
-    o_grad = randn((n0, n1, mhc_mult, h), dtype=torch.bfloat16, device=device)
+    o_grad = randn((n0, n1, mhc_mult, h), dtype=dtype, device=device)
 
     return {
         'x': x,
@@ -35,9 +37,10 @@ def generate_mhc_post_test_data(
 
 @pytest.mark.parametrize('n0', [1, 2])
 @pytest.mark.parametrize('n1', [4096])
-@pytest.mark.parametrize('h', [1280, 2560, 5120, 7168])
-def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
-    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=4)
+@pytest.mark.parametrize('h', generate_hidden_sizes(max(get_test_level(), 1), ['main'], align=128))
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+def test_mhc_post_comprehensive(n0: int, n1: int, h: int, dtype: torch.dtype) -> None:
+    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=4, dtype=dtype)
 
     out_tl = mhc_post_fwd(
         test_data['x'],
@@ -81,27 +84,22 @@ def test_mhc_post_comprehensive(n0: int, n1: int, h: int) -> None:
     )
 
 
-_POST_FWD_BENCH_CASES = [
-    (1, 512, 7168, 4),
-    (1, 512, 5120, 4),
-    (1, 512, 4096, 4),
-    (1, 8192, 7168, 4),
-    (1, 8192, 5120, 4),
-    (1, 8192, 4096, 4),
-]
+_POST_FWD_BENCH_CASES = [(1, n1, h, 4) for n1 in (512, 8192) for h in generate_hidden_sizes(1, ['main'])]
 
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize('n0,n1,h,mhc_mult', _POST_FWD_BENCH_CASES)
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_mhc_post_fwd_benchmark(
     n0: int,
     n1: int,
     h: int,
     mhc_mult: int,
+    dtype: torch.dtype,
     benchmark_timer,
     benchmark_record,
 ) -> None:
-    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult)
+    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult, dtype=dtype)
     x = test_data['x']
     residual = test_data['residual']
     post_layer_mix = test_data['post_layer_mix']
@@ -115,7 +113,7 @@ def test_mhc_post_fwd_benchmark(
     benchmark_record(
         kernel='mhc_post_fwd',
         operation='post_forward',
-        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult},
+        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult, 'dtype': str(dtype)},
         time_us=t_us,
         bandwidth_gbs=io_gb / t_us * 1e6,
         extras={'io_gb': io_gb},
@@ -124,15 +122,17 @@ def test_mhc_post_fwd_benchmark(
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize('n0,n1,h,mhc_mult', _POST_FWD_BENCH_CASES)
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 def test_mhc_post_bwd_benchmark(
     n0: int,
     n1: int,
     h: int,
     mhc_mult: int,
+    dtype: torch.dtype,
     benchmark_timer,
     benchmark_record,
 ) -> None:
-    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult)
+    test_data = generate_mhc_post_test_data(n0=n0, n1=n1, h=h, mhc_mult=mhc_mult, dtype=dtype)
     x = test_data['x']
     residual = test_data['residual']
     post_layer_mix = test_data['post_layer_mix']
@@ -166,7 +166,7 @@ def test_mhc_post_bwd_benchmark(
     benchmark_record(
         kernel='mhc_post_bwd',
         operation='post_backward',
-        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult},
+        params={'n0': n0, 'n1': n1, 'h': h, 'mhc_mult': mhc_mult, 'dtype': str(dtype)},
         time_us=t_us,
         bandwidth_gbs=io_gb / t_us * 1e6,
         extras={'io_gb': io_gb},

@@ -5,24 +5,7 @@ from tilelang import language as T
 
 from tile_kernels.utils import align, is_power_of_two
 from tile_kernels.quant.common import *
-
-
-@T.macro
-def rbits_hash(values, quad_idx):
-    h = T.alloc_var(T.uint32)
-    h = (
-        T.reinterpret(values[0], T.uint32) * T.uint32(0x5671D42B)
-        + T.reinterpret(values[1], T.uint32) * T.uint32(0x9995E499)
-        + T.reinterpret(values[2], T.uint32) * T.uint32(0xACE1B8A5)
-        + T.reinterpret(values[3], T.uint32) * T.uint32(0xE153538D)
-        + T.cast(quad_idx, T.uint32)
-    )
-    h = h ^ (h >> 23)
-    h = h * T.uint32(0x7FEB352D)
-    h = h ^ (h >> 16)
-    h = h * T.uint32(0x846CA68B)
-    h = h ^ (h >> 11)
-    return h
+from tile_kernels.quant.stochastic_rounding import rbits_hash_cuda
 
 
 @tilelang.jit(
@@ -169,7 +152,7 @@ def get_per_token_cast_kernel_cuda(
                                     * sf_inv_fragment[i, (j * 4 + k) // num_per_channels]
                                 )
                                 x_fp32_local[k] = T.float32(x_fragment[i, j * 4 + k]) * factor
-                            rbits = rbits_hash(x_fp32_local, pid_hidden * (block_k // 4) + j)
+                            rbits = rbits_hash_cuda(x_fp32_local, pid_hidden * (block_k // 4) + j, num_rbits=1)[0]
                             for k in T.vectorized(4):
                                 out_fragment_or_shared[i, j * 4 + k] = T.cast(x_fp32_local[k], out_config.dtype, round='rs', rbits=rbits)
                     else:
@@ -205,7 +188,7 @@ def get_per_token_cast_kernel_cuda(
                         for i, j in T.Parallel(block_m, block_k // 4):
                             for k in T.vectorized(4):
                                 x_fp32_local[k] = x_fragment[i, j * 4 + k] * sf_inv_fragment[i, (j * 4 + k) // num_per_channels]
-                            rbits = rbits_hash(x_fp32_local, pid_hidden * (block_k // 4) + j)
+                            rbits = rbits_hash_cuda(x_fp32_local, pid_hidden * (block_k // 4) + j, num_rbits=1)[0]
                             for k in T.vectorized(4):
                                 out_fragment_or_shared[i, j * 4 + k] = T.cast(x_fp32_local[k], out_config.dtype, round='rs', rbits=rbits)
                     else:

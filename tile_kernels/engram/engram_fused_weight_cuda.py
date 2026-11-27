@@ -1,3 +1,4 @@
+import math
 import tilelang
 from tilelang import language as T
 
@@ -10,19 +11,21 @@ from tilelang import language as T
 def get_engram_fused_weight_kernel_cuda(
     hidden_size: int,
     hc_mult: int,
+    dtype: T.dtype = T.bfloat16,
     use_pdl: bool = False,
 ):
-    """Elementwise bf16 x bf16 -> fp32 for weight_hidden * weight_embed."""
+    """Elementwise bf16/fp32 weights -> fp32 for weight_hidden * weight_embed."""
+    assert dtype in (T.bfloat16, T.float32)
     threads = 32
-    vec_size = 8
+    vec_size = math.gcd(8, hidden_size // 32)
     blk_d = threads * vec_size
     assert hidden_size % blk_d == 0
     num_blk = hidden_size // blk_d
 
     @T.prim_func
     def engram_fused_weight_kernel_cuda(
-        weight_hidden: T.Tensor[(hc_mult, hidden_size), T.bfloat16],
-        weight_embed: T.Tensor[(hc_mult, hidden_size), T.bfloat16],
+        weight_hidden: T.Tensor[(hc_mult, hidden_size), dtype],
+        weight_embed: T.Tensor[(hc_mult, hidden_size), dtype],
         weight_fused: T.Tensor[(hc_mult, hidden_size), T.float],
     ):
         with T.Kernel(hc_mult, num_blk, threads=threads) as (pid_h, pid_b):

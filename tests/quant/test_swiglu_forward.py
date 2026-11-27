@@ -51,8 +51,8 @@ def generate_test_params(level: int) -> list[dict]:
         }
         for moe in generate_moe_params(level)
         for fmt in ('bf16', 'fp32', 'e4m3')
-        for num_per_channels in (((32,) if is_ascend() else (128, 32)) if fmt == 'e4m3' else (None,))
-        for hidden_size in [h // 2 for h in ([4096, 7168] if level == 0 else generate_hidden_sizes(256))]
+        for num_per_channels in ((32,) if fmt == 'e4m3' else (None,))
+        for hidden_size in generate_hidden_sizes(level, ['ffn'], align=128)
         for use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0 in generate_cast_config(level, fmt)
         for with_psum_layout in ((True,) if level == 0 else (True, False))
         for args in generate_samples(

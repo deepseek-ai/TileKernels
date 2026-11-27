@@ -5,12 +5,14 @@ import torch
 
 from tile_kernels.config import get_device, is_ascend
 from tile_kernels.mhc.norm_fn_kernel import (
+    default_n_splits,
     mhc_fn_normw_merge_bwd,
     mhc_fn_normw_merge_fwd,
     mhc_reduce_partials_and_rmsnorm_bwd,
     mhc_reduce_partials_and_rmsnorm_fwd,
 )
 from tile_kernels.rand import randn, randn_like
+from tile_kernels.testing.generator import generate_hidden_sizes, get_test_level
 from tile_kernels.testing.numeric import count_bytes
 from tile_kernels.torch.mhc import mhc_pre_norm_fn_partials_ref, mhc_pre_norm_fn_ref
 
@@ -100,8 +102,8 @@ def _ref_reduce_rmsnorm(
     return (out_mul * rms.unsqueeze(-1)).sum(-2)
 
 
-@pytest.mark.parametrize('n1', [4096, 8192])
-@pytest.mark.parametrize('hidden_size', [320, 1280, 2560, 4096, 5120, 7168])
+@pytest.mark.parametrize('n1', [4096, 8192, 509, 8191])
+@pytest.mark.parametrize('hidden_size', generate_hidden_sizes(max(get_test_level(), 1), ['main']))
 @pytest.mark.parametrize('generate_normw', [False, True])
 def test_correctness(
     n1: int,
@@ -112,7 +114,8 @@ def test_correctness(
 
     The prenorm GEMM moved to DeepGEMM, so its outputs are built from the
     torch reference and only the two remaining norm-fn operators are
-    exercised here.
+    exercised here. n1=509 and 8191 are not multiples of the kernel token block
+    (16, or 32 for the large-M forward), so they cover the ragged trailing block.
     """
     mhc_mult = 4
     mhc_hidden_size = mhc_mult * hidden_size
@@ -131,7 +134,7 @@ def test_correctness(
     mhc_norm_eps = test_data['mhc_norm_eps']
     num_tokens = residual.shape[0] * residual.shape[1]
 
-    actual_n_splits = 1 if is_ascend() else 16
+    actual_n_splits = default_n_splits(mhc_hidden_size)
     merged_fn = fn
     if normw is not None:
         # fn x normw merge, compared against the merge that mhc_pre_norm_fn_ref
@@ -190,7 +193,7 @@ def test_correctness(
     _assert_calc_diff_close(sqrsum_grad, sqrsum_ref.grad, tol=1e-8)
 
 
-_NORMW_MERGE_BENCH_CASES = [5120, 10240, 16384, 20480, 28672]
+_NORMW_MERGE_BENCH_CASES = generate_hidden_sizes(1, ['4*main'])
 
 
 @pytest.mark.benchmark

@@ -11,6 +11,7 @@ def get_engram_hash_kernel_cuda(
     max_ngram_size: int = 3,
     num_ngram_layers: int = 2,
     num_embed_table_per_ngram: int = 8,
+    has_reciprocal: bool = False,
     has_image_token_mask: bool = False,
     use_pdl: bool = False,
 ):
@@ -24,6 +25,7 @@ def get_engram_hash_kernel_cuda(
         ngram_token_ids: T.Tensor[(num_tokens, max_ngram_size), T.int32],
         multipliers: T.Tensor[(num_ngram_layers, max_ngram_size), T.int64],
         vocab_sizes: T.Tensor[(num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), T.int32],
+        reciprocal: T.Tensor[(num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), T.uint64],
         offsets: T.Tensor[(num_ngram_layers, num_out_cols), T.int32],
         image_token_mask: T.Tensor[(num_tokens,), T.bool],
         output: T.Tensor[(num_ngram_layers, num_tokens, num_out_cols), T.int32],
@@ -33,36 +35,40 @@ def get_engram_hash_kernel_cuda(
                 T.pdl_sync()
             tid = T.get_thread_binding()
             token_idx = pid_s * blk_m + tid
+            output_local = T.alloc_local((num_out_cols,), T.int32)
+            hash_local = T.alloc_local((1,), T.uint64)
+            remainder = T.alloc_local((1,), T.uint32)
+
+            if not has_reciprocal:
+                reciprocal_shared = T.alloc_shared((num_out_cols,), T.uint64)
+                for i in T.serial(T.ceildiv(num_out_cols, threads)):
+                    col = i * threads + tid
+                    if col < num_out_cols:
+                        divisor = vocab_sizes[pid_h, col // num_embed_table_per_ngram, col % num_embed_table_per_ngram]
+                        reciprocal_shared[col] = T.floordiv(T.uint64(0xFFFFFFFFFFFFFFFF), T.cast(divisor, T.uint64))
+                T.sync_threads()
             if token_idx >= num_tokens:
                 T.thread_return()
-            x_local = T.alloc_local((max_ngram_size,), T.int32)
-            multipliers_local = T.alloc_local((max_ngram_size,), T.int64)
-            vocab_sizes_local = T.alloc_local((max_ngram_size - 1, num_embed_table_per_ngram), T.int32)
-            offsets_local = T.alloc_local((num_out_cols,), T.int32)
-            output_local = T.alloc_local((num_out_cols,), T.int32)
-            hash_local = T.alloc_var(T.int64)
 
             if has_image_token_mask and image_token_mask[token_idx]:
-                for col in T.vectorized(num_out_cols):
-                    output[pid_h, token_idx, col] = -1
+                T.fill(output_local, -1)
             else:
-                T.copy(multipliers[pid_h, :], multipliers_local)
-                T.copy(vocab_sizes[pid_h, :, :], vocab_sizes_local)
-                T.copy(offsets[pid_h, :], offsets_local)
-                T.copy(ngram_token_ids[token_idx, :], x_local)
-
-                hash_local = 0
-                for ngram_idx in T.unroll(0, max_ngram_size):
-                    hash_local = T.bitwise_xor(
-                        hash_local,
-                        T.cast(x_local[ngram_idx], T.int64) * multipliers_local[ngram_idx],
+                hash_local[0] = T.cast(ngram_token_ids[token_idx, 0], T.uint64) * T.cast(multipliers[pid_h, 0], T.uint64)
+                for ngram_idx in T.unroll(1, max_ngram_size):
+                    hash_local[0] = T.bitwise_xor(
+                        hash_local[0],
+                        T.cast(ngram_token_ids[token_idx, ngram_idx], T.uint64) * T.cast(multipliers[pid_h, ngram_idx], T.uint64),
                     )
-                    if ngram_idx > 0:
-                        for j in T.unroll(num_embed_table_per_ngram):
-                            col = (ngram_idx - 1) * num_embed_table_per_ngram + j
-                            output_local[col] = (hash_local % T.cast(vocab_sizes_local[ngram_idx - 1, j], T.int64)) + offsets_local[col]
-
-                T.copy(output_local, output[pid_h, token_idx, :])
+                    for j in T.unroll(num_embed_table_per_ngram):
+                        col = (ngram_idx - 1) * num_embed_table_per_ngram + j
+                        divisor = T.cast(vocab_sizes[pid_h, ngram_idx - 1, j], T.uint32)
+                        mu = reciprocal[pid_h, ngram_idx - 1, j] if has_reciprocal else reciprocal_shared[col]
+                        quotient = T.call_pure_extern(T.uint64, '__umul64hi', hash_local[0], mu)
+                        remainder[0] = T.cast(hash_local[0], T.uint32) - T.cast(quotient, T.uint32) * divisor
+                        if remainder[0] >= divisor:
+                            remainder[0] -= divisor
+                        output_local[col] = T.cast(remainder[0], T.int32) + offsets[pid_h, col]
+            T.copy(output_local, output[pid_h, token_idx, :])
             if use_pdl:
                 T.pdl_trigger()
 

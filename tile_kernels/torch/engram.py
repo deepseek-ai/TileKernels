@@ -125,8 +125,9 @@ def engram_hash_ref(
     """Pure PyTorch reference implementation of engram hash.
 
     Args:
-        ngram_token_ids: N-gram token IDs of shape (num_tokens, max_ngram_size), int32.
-        multipliers: Per-layer hash multipliers of shape (num_ngram_layers, max_ngram_size), int64.
+        ngram_token_ids: Nonnegative N-gram token IDs of shape (num_tokens, max_ngram_size), int32.
+        multipliers: Nonnegative per-layer hash multipliers of shape (num_ngram_layers, max_ngram_size), int64.
+            Each token ID times its multiplier must be less than 2**63.
         vocab_sizes: Per-layer per-ngram embedding table sizes of shape
             (num_ngram_layers, max_ngram_size - 1, num_embed_table_per_ngram), int32.
         offsets: Per-layer embedding table offsets of shape
@@ -162,6 +163,7 @@ def engram_gate_ref(
     kv: torch.Tensor,
     weight_hidden: torch.Tensor,
     weight_embed: torch.Tensor,
+    weight_value: torch.Tensor | None,
     clamp_value: float,
     eps: float,
     save_for_backward: bool = False,
@@ -169,21 +171,23 @@ def engram_gate_ref(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure PyTorch reference implementation of engram gate (vectorized, supports autograd).
 
-    Computes: output = x + sigmoid(signed_sqrt(dot(RMSNorm(x, wh), RMSNorm(k, we)) * scalar)) * v
+    Computes: output = x + sigmoid(signed_sqrt(dot(RMSNorm(x, wh), RMSNorm(k, we)) * scalar)) * value,
+    where value is RMSNorm(v, weight_value) when weight_value is provided, and v otherwise.
 
     Args:
-        hidden_states: Input of shape (num_tokens, hc_mult, hidden_size), bfloat16.
-        kv: Packed key/value embeddings of shape (num_tokens, (hc_mult + 1), hidden_size), bfloat16.
+        hidden_states: Input of shape (num_tokens, hc_mult, hidden_size), bfloat16 or float32.
+        kv: Packed key/value embeddings of shape (num_tokens, (hc_mult + 1), hidden_size), bfloat16 or float32.
         weight_hidden: RMSNorm weight for hidden states, shape (hc_mult, hidden_size), bfloat16.
         weight_embed: RMSNorm weight for key embeddings, shape (hc_mult, hidden_size), bfloat16.
+        weight_value: Optional RMSNorm weight for v, shape (hidden_size,), bfloat16 or float32.
         clamp_value: Clamp threshold for signed-sqrt gate activation.
         eps: Epsilon for RMSNorm numerical stability.
-        save_for_backward: If True, also return (dot, gate_score, rstd_x, rstd_k).
+        save_for_backward: If True, also return (dot, gate_score, rstd_x, rstd_kv).
         image_token_mask: Optional, ``True`` stands for image tokens, shape (num_tokens,), bool.
 
     Returns:
-        If save_for_backward is False: output tensor of shape (num_tokens, hc_mult, hidden_size), bfloat16.
-        If save_for_backward is True: tuple of (output, dot, gate_score, rstd_x, rstd_k).
+        If save_for_backward is False: output tensor with the same shape and dtype as hidden_states.
+        If save_for_backward is True: tuple of (output, dot, gate_score, rstd_x, rstd_kv).
     """
     _, hc_mult, hidden_size = hidden_states.shape
     scalar = hidden_size**-0.5
@@ -207,11 +211,18 @@ def engram_gate_ref(
     signed_sqrt = dot.abs().clamp_min(clamp_value).sqrt() * dot.sign()
     gate_score = signed_sqrt.sigmoid()
 
+    rstd_kv = rstd_k
+    if weight_value is not None:
+        v = v.float()
+        rstd_v = torch.rsqrt(v.square().mean(-1) + eps)
+        v = v * rstd_v.unsqueeze(-1) * weight_value.float()
+        rstd_kv = torch.cat((rstd_k, rstd_v.unsqueeze(-1)), dim=-1)
+
     output = x + gate_score.unsqueeze(-1) * v.unsqueeze(-2)
-    output = output.bfloat16()
+    output = output.to(hidden_states.dtype)
     if image_token_mask is not None:
         output = torch.where(image_token_mask[..., None, None], hidden_states, output)
 
     if save_for_backward:
-        return output, raw_dot, gate_score, rstd_x, rstd_k
+        return output, raw_dot, gate_score, rstd_x, rstd_kv
     return output

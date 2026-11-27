@@ -9,28 +9,29 @@ def get_engram_sinkhorn_momentum_kernel_asc(
     momentum_dtype: T.dtype,
     nesterov: bool,
     beta1: float,
+    alignment: int,
     num_vec_cores: int,
 ):
     vec_size = 64
-    row_size = 256
-    rows_per_tile = 16
+    assert alignment in (128, 256)
+    rows_per_tile = 4096 // alignment
     num_stages = 4
 
     num_rows = T.dynamic('num_rows')
-    num_chunks = row_size // vec_size
+    num_chunks = alignment // vec_size
     grad_is_bf16 = grad_dtype == T.bfloat16
     momentum_is_bf16 = momentum_dtype == T.bfloat16
 
     @T.prim_func
     def engram_sinkhorn_momentum_kernel_asc(
-        grad: T.Tensor[(num_rows, row_size), grad_dtype],
-        momentum_buffer: T.Tensor[(num_rows, row_size), momentum_dtype],
-        sinkhorn_input: T.Tensor[(num_rows, row_size), T.float32],
+        grad: T.Tensor[(num_rows, alignment), grad_dtype],
+        momentum_buffer: T.Tensor[(num_rows, alignment), momentum_dtype],
+        sinkhorn_input: T.Tensor[(num_rows, alignment), T.float32],
     ):
         with T.Kernel(num_vec_cores) as core_id:
-            grad_ub = T.alloc_shared((rows_per_tile, row_size), grad_dtype)
-            momentum_ub = T.alloc_shared((rows_per_tile, row_size), momentum_dtype)
-            sinkhorn_ub = T.alloc_shared((rows_per_tile, row_size), T.float32)
+            grad_ub = T.alloc_shared((rows_per_tile, alignment), grad_dtype)
+            momentum_ub = T.alloc_shared((rows_per_tile, alignment), momentum_dtype)
+            sinkhorn_ub = T.alloc_shared((rows_per_tile, alignment), T.float32)
             T.annotate_buffer_versions(
                 {
                     grad_ub: num_stages,
@@ -92,7 +93,7 @@ def get_engram_sinkhorn_step_kernel_asc(
     num_vec_cores: int,
 ):
     vec_size = 64
-    num_accs = 4
+    num_accs = 4 if head_dim % 256 == 0 else 2
     assert head_dim % (vec_size * num_accs) == 0
     num_rows = T.dynamic('num_rows')
     num_chunks = head_dim // vec_size
@@ -148,8 +149,9 @@ def get_engram_sinkhorn_step_kernel_asc(
                                 S.vmula(accum[acc_id], base, base)
                                 S.vsts(matrix_ub[offset], base)
 
-                        for acc_id in T.unroll(2, explicit=True):
-                            accum[acc_id] = S.vadd(accum[acc_id], accum[acc_id + 2])
+                        if num_accs == 4:
+                            for acc_id in T.unroll(2, explicit=True):
+                                accum[acc_id] = S.vadd(accum[acc_id], accum[acc_id + 2])
                         accum[0] = S.vadd(accum[0], accum[1])
 
                         norm = S.vsqrt(S.vcadd(accum[0]))
@@ -185,7 +187,7 @@ def get_engram_sinkhorn_step_reduce_kernel_asc(
     num_vec_cores: int,
 ):
     vec_size = 64
-    num_accs = 4
+    num_accs = 4 if head_dim % 256 == 0 else 2
     blk_d = vec_size * num_accs
     assert head_dim % blk_d == 0
     num_col_blocks = head_dim // blk_d
@@ -223,7 +225,7 @@ def get_engram_sinkhorn_step_reduce_kernel_asc(
     return engram_sinkhorn_step_reduce_kernel_asc
 
 
-@tilelang.jit
+@tilelang.jit(compile_flags=['--cce-disable-vf-stack-reserved-ubuf'])
 def get_engram_sinkhorn_finalize_kernel_asc(
     head_dim: int,
     eps: float,
@@ -231,7 +233,7 @@ def get_engram_sinkhorn_finalize_kernel_asc(
     num_vec_cores: int,
 ):
     vec_size = 64
-    num_accs = 4
+    num_accs = 4 if head_dim % 256 == 0 else 2
     assert head_dim % (vec_size * num_accs) == 0
     num_rows = T.dynamic('num_rows')
     num_chunks = head_dim // vec_size
@@ -277,8 +279,9 @@ def get_engram_sinkhorn_finalize_kernel_asc(
                             S.vmula(accum[acc_id], value, value)
                             S.vsts(out_ub[offset], value)
 
-                    for acc_id in T.unroll(2, explicit=True):
-                        accum[acc_id] = S.vadd(accum[acc_id], accum[acc_id + 2])
+                    if num_accs == 4:
+                        for acc_id in T.unroll(2, explicit=True):
+                            accum[acc_id] = S.vadd(accum[acc_id], accum[acc_id + 2])
                     accum[0] = S.vadd(accum[0], accum[1])
 
                     norm = S.vsqrt(S.vcadd(accum[0]))

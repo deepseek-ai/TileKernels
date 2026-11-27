@@ -49,6 +49,9 @@ def generate_test_data(params):
 
 
 def generate_test_params(level: int) -> list[dict]:
+    hidden_sizes = generate_hidden_sizes(
+        level, ['main', 'ffn', '2*ffn', 'q_lora', '128*indexer', 'wv', 'head', 'attn_context', 'engram_input', '5*main'], align=128
+    )
     return [
         {
             'num_per_tokens': num_per_tokens,
@@ -62,13 +65,13 @@ def generate_test_params(level: int) -> list[dict]:
             'in_round_sf': in_round_sf,
             'in_use_packed_ue8m0': in_use_packed_ue8m0,
         }
-        for num_per_tokens in ((32,) if is_ascend() else (32, 128))
+        for num_per_tokens in (32,)
         for num_tokens in generate_num_tokens(level, 128, backward_only=True)
-        for hidden_size in generate_hidden_sizes(128)
-        for in_dtype in ('bf16', 'e4m3')
+        for hidden_size in hidden_sizes
+        for in_dtype in ('bf16', 'fp32', 'e4m3')
         for in_use_tma_aligned_col_major_sf, in_round_sf, in_use_packed_ue8m0 in generate_cast_config(level, in_dtype)
         for out_round_sf, out_use_packed_ue8m0 in (((False, False), (True, True)) if level >= 1 else ((True, True),))
-        for num_per_channels in (((32,) if is_ascend() else (32, 128)) if in_dtype == 'e4m3' else (None,))
+        for num_per_channels in ((32,) if in_dtype == 'e4m3' else (None,))
     ]
 
 

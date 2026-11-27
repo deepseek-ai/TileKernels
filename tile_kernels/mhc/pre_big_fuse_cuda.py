@@ -25,8 +25,10 @@ def mhc_pre_big_fuse_fwd_cuda(
     sinkhorn_repeat: int,
     hidden_block: int,
     n_splits: int = 16,
+    x_dtype: T.dtype = T.bfloat16,
     use_pdl: bool = False,
 ):
+    assert x_dtype in (T.bfloat16, T.float32)
     num_tokens = T.dynamic('num_tokens')
     mhc_mult = T.const('mhc_mult')
     mhc_mult3 = T.const('mhc_mult3')
@@ -36,10 +38,10 @@ def mhc_pre_big_fuse_fwd_cuda(
     gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32]
     mhc_scale: T.Tensor[(3,), T.float32]
     mhc_base: T.Tensor[(mhc_mult3,), T.float32]
-    residual: T.Tensor[(num_tokens, mhc_mult, hidden_size), T.bfloat16]
+    residual: T.Tensor[(num_tokens, mhc_mult, hidden_size), x_dtype]
     post_mix: T.Tensor[(num_tokens, mhc_mult), T.float32]
     comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32]
-    layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16]
+    layer_input: T.Tensor[(num_tokens, hidden_size), x_dtype]
 
     with T.Kernel(num_tokens, threads=96) as pid:
         if use_pdl:
@@ -118,7 +120,7 @@ def mhc_pre_big_fuse_fwd_cuda(
             ###################################################################
             # _mhc_pre_apply_mix_fwd
             for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-                xs = T.alloc_shared((mhc_mult, hidden_block), T.bfloat16)
+                xs = T.alloc_shared((mhc_mult, hidden_block), x_dtype)
                 xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
                 T.copy(residual[pid, 0, i0_h * hidden_block], xs, disable_tma=True)
                 T.copy(xs, xl, disable_tma=True)
