@@ -142,3 +142,73 @@ def sqrt_softplus_backward_asc(y):
     numerator = S.vsub(S.vdup(1.0, T.float32), S.vexp(S.vneg(u), precision='ftz_true'))
     large = S.vmuls(S.vdiv(numerator, y, precision='ftz_true'), 0.5)
     return S.vsel(small, large, S.vcmps(u, 1.0, op='lt'))
+
+
+@T.macro
+def _horner_Pt_pto(t):
+    poly = _FORWARD_COEFFS[0]
+    for coeff in _FORWARD_COEFFS[1:]:
+        poly = poly * t + coeff
+    return poly
+
+
+# For the selected positive softplus branch, x >= log(2). Newton and the
+# FMA residual correction refine the hardware sqrt/reciprocal estimates.
+@T.macro
+def _vsqrt_rne_pto(x):
+    root0 = T.sqrt(x)
+    recip0 = 1.0 / root0
+    root1 = (root0 + x * recip0) * 0.5
+    resid = root1 * root1 - x
+    corr = recip0 * -0.5
+    return root1 + resid * corr
+
+
+# s = x + l^2, then y = sqrt(s).
+@T.macro
+def _assemble_sqrt_pto(x, l):
+    s = l * l + T.max(x, 0.0)
+    return _vsqrt_rne_pto(s)
+
+
+# Match master in the negative tail: preserve subnormal exp outputs.
+@T.macro
+def _exp_neg_half_abs_pto(x):
+    return T.exp(T.abs(x) * -0.5)
+
+
+# l = a*g = sqrt(log1p(q)) with q = a^2, g = G0 + t*P(t) ~= sqrt(log1p(q)/q), t = 1 - q.
+@T.macro
+def _sqrt_log1p_pto(a):
+    t = 1.0 - a * a
+    p = _horner_Pt_pto(t)
+    t = t * p + _G0
+    return a * t
+
+
+# y = sqrt(softplus(x)): x > 0 -> sqrt(x + l^2), else -> l.
+@T.macro
+def _assemble_softsqrt_pto(x, l):
+    y_pos = _assemble_sqrt_pto(x, l)
+    return T.Select(x > 0.0, y_pos, l)
+
+
+@T.macro
+def sqrt_softplus_forward_pto(logit):
+    a = _exp_neg_half_abs_pto(logit)
+    l = _sqrt_log1p_pto(a)
+    return _assemble_softsqrt_pto(logit, l)
+
+
+@T.macro
+def sqrt_softplus_backward_pto(y):
+    """Recover dy/dx from y=sqrt(softplus(x)); use the polynomial only for y²<1."""
+    u = y * y
+    q = _BACKWARD_COEFFS[0]
+    for coeff in _BACKWARD_COEFFS[1:]:
+        q = q * u + coeff
+    half_y = y * 0.5
+    small = (u * q) * half_y + half_y
+    numerator = 1.0 - T.exp(-u)
+    large = (numerator / y) * 0.5
+    return T.Select(u < 1.0, small, large)
