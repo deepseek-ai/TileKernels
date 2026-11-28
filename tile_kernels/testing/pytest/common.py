@@ -31,6 +31,12 @@ def item_source_file(item):
     tests are collected too; an unguarded ``os.path.relpath`` would yield
     ``../..`` paths that resolve outside the data directories when reused as
     shard names.
+
+    Both sides are resolved with ``os.path.realpath`` because pytest reports
+    ``item.path`` with symlinks resolved while the tests root may be exported
+    in its symlinked form (e.g. ``TK_TESTS_DIR=$PWD/tests`` from a checkout
+    under a symlinked path).  A purely lexical comparison makes every item look
+    like it lives outside the tests root, which would silently drop all shards.
     """
     path = getattr(item, 'path', None)
     if path is None:
@@ -40,7 +46,7 @@ def item_source_file(item):
     tests_dir = get_tests_dir()
     if not tests_dir:
         return None
-    relpath = os.path.relpath(os.path.abspath(str(path)), os.path.abspath(tests_dir))
+    relpath = os.path.relpath(os.path.realpath(str(path)), os.path.realpath(tests_dir))
     if relpath == os.pardir or relpath.startswith(os.pardir + os.sep):
         return None
     return relpath
